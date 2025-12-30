@@ -123,33 +123,33 @@ exports.resendPaymentLink = async (req, res) => {
     }
 
     // 🧠 Build Stripe params once
-    if (!booking.stripeSessionParams) {
-      booking.stripeSessionParams = {
-        mode: 'payment',
-        payment_method_types: ['card'],
-        customer_email: booking.contact.email,
-        line_items: [{
-          price_data: {
-            currency: booking.price.currency || 'INR',
-            product_data: { name: `Flight Booking ${booking.bookingRef}` },
-            unit_amount: Math.round(booking.price.amount * 100)
-          },
-          quantity: 1
-        }],
-        success_url: `${process.env.FRONTEND_URL}/booking-details/${booking.bookingRef}?payment=success`,
-        cancel_url: `${process.env.FRONTEND_URL}/booking-details/${booking.bookingRef}?payment=cancelled`,
-        metadata: {
-          bookingId: booking._id.toString(),
-          bookingRef: booking.bookingRef
-        }
-      };
-    }
+    const stripeSessionParams = {
+      mode: 'payment',
+      payment_method_types: ['card'],
+      customer_email: booking.contact.email,
+      line_items: [{
+        price_data: {
+          currency: booking.price.currency || 'INR',
+          product_data: { name: `Flight Booking ${booking.bookingRef}` },
+          unit_amount: Math.round(booking.price.amount * 100)
+        },
+        quantity: 1
+      }],
+      success_url: `${process.env.FRONTEND_URL}/booking-details/${booking.bookingRef}?payment=success`,
+      cancel_url: `${process.env.FRONTEND_URL}/booking-details/${booking.bookingRef}?payment=cancelled`,
+      metadata: {
+        bookingId: booking._id.toString(),
+        bookingRef: booking.bookingRef
+      }
+    };
+
 
     // ✅ CREATE Stripe Checkout session
     const session = await stripe.checkout.sessions.create(
-      booking.stripeSessionParams,
+      stripeSessionParams,
       { idempotencyKey: `resend_${booking._id}_${Date.now()}` }
     );
+
 
     // 📝 Persist retry state
     booking.stripeSessionId = session.id;
