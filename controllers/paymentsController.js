@@ -772,30 +772,28 @@ exports.webhook = async (req, res) => {
         try {
           const emailer = (() => { try { return require('../utils/emailer'); } catch (e) { return null; } })();
 
-          async function logEmailPreview({ to, subject, text, pdfBuffer, booking }) {
-            console.log("\n================ EMAIL PREVIEW ================");
-            console.log("To:        ", to || "(no recipient)");
-            console.log("Subject:   ", subject);
-            console.log("Message:\n", text);
-            console.log("----------------------------------------------");
+          // async function logEmailPreview(payload) {
+          //   if (process.env.NODE_ENV !== 'development') return;
 
-            if (booking) {
-              console.log("BookingRef:", booking.bookingRef);
-              console.log("Passenger Count:", booking.passengers?.length);
-              console.log("Seats:", booking.seats?.map(s => s.label || s.seatId).join(", "));
-              console.log("Price:", JSON.stringify(booking.price));
-            }
+          //   const { to, subject, text, pdfBuffer, booking } = payload;
 
-            if (pdfBuffer && Buffer.isBuffer(pdfBuffer)) {
-              const b64 = pdfBuffer.toString("base64");
-              console.log("PDF Attachment (Base64):");
-              console.log(`data:application/pdf;base64,${b64}`);
-            } else {
-              console.log("PDF Attachment: (none)");
-            }
+          //   console.log("\n================ EMAIL PREVIEW ================");
+          //   console.log("To:        ", to || "(no recipient)");
+          //   console.log("Subject:   ", subject);
+          //   console.log("Message:\n", text);
+          //   console.log("----------------------------------------------");
 
-            console.log("==============================================\n");
-          }
+          //   if (booking) {
+          //     console.log("BookingRef:", booking.bookingRef);
+          //     console.log("Passenger Count:", booking.passengers?.length);
+          //     console.log("Seats:", booking.seats?.map(s => s.label || s.seatId).join(", "));
+          //     console.log("Price:", JSON.stringify(booking.price));
+          //   }
+
+          //   console.log("PDF Attachment:", pdfBuffer ? "(attached)" : "(none)");
+          //   console.log("==============================================\n");
+          // }
+
 
           if (updatedBooking) {
             const TO = updatedBooking?.contact?.email || "unknown@example.com";
@@ -864,7 +862,7 @@ exports.webhook = async (req, res) => {
       }
 
       default:
-        // console.log('[payments] unhandled event type', event.type);
+      // console.log('[payments] unhandled event type', event.type);
     }
 
     res.json({ received: true });
