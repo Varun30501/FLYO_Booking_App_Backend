@@ -1022,7 +1022,7 @@ exports.create = async (req, res) => {
             },
             quantity: 1
           }],
-          success_url: `${process.env.FRONTEND_URL}/booking-details/${booking.bookingRef}?payment=success`,
+          success_url: `${process.env.FRONTEND_URL}/booking-details/${booking.bookingRef}?payment=true`,
           cancel_url: `${process.env.FRONTEND_URL}/booking-details/${booking.bookingRef}?payment=cancelled`,
           metadata: {
             bookingId: booking._id.toString(),
