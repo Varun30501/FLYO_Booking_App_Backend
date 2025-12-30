@@ -812,10 +812,8 @@ exports.webhook = async (req, res) => {
               } catch (err) {
                 console.warn('[payments] sendBookingConfirmation failed', err?.message);
               }
-              await logEmailPreview({ to: TO, subject: SUBJECT, text: TEXT, pdfBuffer: null, booking: updatedBooking });
-            } else {
-              await logEmailPreview({ to: TO, subject: SUBJECT, text: TEXT, pdfBuffer: null, booking: updatedBooking });
             }
+
           }
         } catch (notifyErr) {
           console.error('[payments] post-payment notification error', notifyErr?.message);
