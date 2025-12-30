@@ -315,24 +315,24 @@ function composeBookingEmail(b) {
       <h2>Booking Confirmed — ${bookingRef}</h2>
       <p>Your booking <strong>${bookingRef}</strong> is confirmed.</p>
 
-      <h3>Flight details</h3>
-<p>
-  <strong>Flight:</strong> ${b.airline || 'Flight'} ${b.flightNumber || b.flightId || '—'}<br/>
- <strong>Route:</strong> ${b.origin || '—'} → ${b.destination || '—'}<br/>
-  <strong>Departure:</strong> ${safeDate(b.departureAt)}<br/>
-  <strong>Arrival:</strong> ${safeDate(b.arrivalAt)}
-</p>
+//       <h3>Flight details</h3>
+// <p>
+//   <strong>Flight:</strong> ${b.airline || 'Flight'} ${b.flightNumber || b.flightId || '—'}<br/>
+//  <strong>Route:</strong> ${b.origin || '—'} → ${b.destination || '—'}<br/>
+//   <strong>Departure:</strong> ${safeDate(b.departureAt)}<br/>
+//   <strong>Arrival:</strong> ${safeDate(b.arrivalAt)}
+// </p>
 
-<h3>Fare breakup</h3>
-<ul>
-  <li>Base fare: ₹${b.price?.base}</li>
-  <li>Seats & class: ₹${b.price?.seatTotal}</li>
-  <li>Add-ons: ₹${b.price?.addonsTotal}</li>
-  <li>Discounts: -₹${b.price?.discountsTotal}</li>
-  <li>Taxes: ₹${b.price?.taxes}</li>
-</ul>
+// <h3>Fare breakup</h3>
+// <ul>
+//   <li>Base fare: ₹${b.price?.base}</li>
+//   <li>Seats & class: ₹${b.price?.seatTotal}</li>
+//   <li>Add-ons: ₹${b.price?.addonsTotal}</li>
+//   <li>Discounts: -₹${b.price?.discountsTotal}</li>
+//   <li>Taxes: ₹${b.price?.taxes}</li>
+// </ul>
 
-<p><strong>Total paid: ₹${b.price?.amount}</strong></p>
+// <p><strong>Total paid: ₹${b.price?.amount}</strong></p>
 
 
       <h3>Flight & Passenger details</h3>
