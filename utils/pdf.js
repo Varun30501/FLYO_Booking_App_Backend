@@ -81,21 +81,6 @@ function generateItineraryPDF(booking) {
       doc.text(`Booking created: ${b.createdAt ? new Date(b.createdAt).toLocaleString() : '—'}`);
       doc.moveDown(0.6);
 
-      doc.text(`Flight: ${booking.airline} ${booking.flightNumber || booking.flightId}`);
-      doc.text(`Route: ${booking.origin} → ${booking.destination}`);
-      doc.text(`Departure: ${new Date(booking.departureAt).toLocaleString()}`);
-      doc.text(`Arrival: ${new Date(booking.arrivalAt).toLocaleString()}`);
-
-      doc.moveDown();
-      doc.text("Fare breakup");
-      doc.text(`Base fare: ₹${booking.price?.base}`);
-      doc.text(`Seats & class: ₹${booking.price?.seatTotal}`);
-      doc.text(`Add-ons: ₹${booking.price?.addonsTotal}`);
-      doc.text(`Discounts: -₹${booking.price?.discountsTotal}`);
-      doc.text(`Taxes: ₹${booking.price?.taxes}`);
-      doc.moveDown();
-      doc.text(`Total paid: ₹${booking.price?.amount}`, { bold: true });
-
       // Flight meta
       doc.fontSize(12).font('Helvetica-Bold').text('Flight Details');
       doc.moveDown(0.2);
