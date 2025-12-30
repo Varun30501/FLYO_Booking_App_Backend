@@ -42,7 +42,7 @@ async function getToken() {
 
     cachedToken = data.access_token;
     cachedExpiry = Date.now() + ((Number(data.expires_in) || 3600) - 200) * 1000;
-    console.log('[amadeus] fetched token (len=' + (cachedToken ? cachedToken.length : 0) + ') expires_in=' + (data.expires_in || 0));
+    // console.log('[amadeus] fetched token (len=' + (cachedToken ? cachedToken.length : 0) + ') expires_in=' + (data.expires_in || 0));
     return cachedToken;
   } catch (err) {
     console.error('[amadeus] token fetch error:', err && (err.response ? err.response.data || err.response.status : err.message));
@@ -209,7 +209,7 @@ async function search({ origin, destination, date, limit = 20 } = {}) {
       max: limit
     };
 
-    console.log('[amadeus] issuing search', { ...params, ts: new Date().toISOString() });
+    // console.log('[amadeus] issuing search', { ...params, ts: new Date().toISOString() });
 
     const call = await callAmadeusWithRetries('/v2/shopping/flight-offers', { params, timeout: 15000, attempts: 4 });
 
