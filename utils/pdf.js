@@ -15,9 +15,16 @@ function formatMoneyMajor(amount, currency = 'INR') {
 
 function computePriceBreakdown(booking) {
   const seatsMeta = Array.isArray(booking.seatsMeta) ? booking.seatsMeta : [];
-  const seatsSubtotal = seatsMeta.reduce((acc, s) => acc + (Number(s.price || 0)), 0);
-  const classExtras = seatsMeta.reduce((acc, s) => acc + (Number(s.priceModifier || 0)), 0);
-  const baseSubtotal = Math.max(0, seatsSubtotal - classExtras);
+  // Seats subtotal = final seat prices (already discounted)
+  const seatsSubtotal = seatsMeta.reduce(
+    (acc, s) => acc + Number(s.price || 0),
+    0
+  );
+
+  // Base/class split is no longer reliable post SeatMap v3
+  const baseSubtotal = seatsSubtotal;
+  const classExtras = 0;
+
 
   // addons
   const addonsArr = Array.isArray(booking.addons) ? booking.addons : [];
@@ -128,15 +135,15 @@ function generateItineraryPDF(booking) {
       const labelColX = doc.x;
       const valueColX = doc.page.width - doc.page.margins.right - 140;
 
-      doc.text('Base price (sum of base fares):', labelColX, doc.y, { continued: true });
+      doc.text('Seat fares:', labelColX, doc.y, { continued: true });
       doc.text(formatMoneyMajor(pb.baseSubtotal, pb.currency), valueColX, doc.y);
       doc.moveDown(0.2);
 
-      doc.text('Class / seat extras:', labelColX, doc.y, { continued: true });
+      doc.text('Seat adjustments / upgrades:', labelColX, doc.y, { continued: true });
       doc.text(formatMoneyMajor(pb.classExtras, pb.currency), valueColX, doc.y);
       doc.moveDown(0.2);
 
-      doc.text('Seats subtotal (base + class):', labelColX, doc.y, { continued: true });
+      doc.text('Seats total:', labelColX, doc.y, { continued: true });
       doc.text(formatMoneyMajor(pb.seatsSubtotal, pb.currency), valueColX, doc.y);
       doc.moveDown(0.2);
 
@@ -291,8 +298,8 @@ function generateCancellationInvoicePDF(booking) {
         refund?.created
           ? new Date(refund.created * 1000)
           : b.cancelledAt
-          ? new Date(b.cancelledAt)
-          : new Date();
+            ? new Date(b.cancelledAt)
+            : new Date();
 
       const doc = new PDFDocument({ size: "A4", margin: 40 });
       const chunks = [];
@@ -325,19 +332,18 @@ function generateCancellationInvoicePDF(booking) {
       doc.fontSize(10).font("Helvetica");
       doc.text(`Flight ID: ${b.flightId || "—"}`);
       doc.text(
-        `Passengers: ${
-          Array.isArray(b.passengers) ? b.passengers.length : 0
+        `Passengers: ${Array.isArray(b.passengers) ? b.passengers.length : 0
         }`
       );
       const seats =
         Array.isArray(b.seats) && b.seats.length
           ? b.seats
-              .map((s) =>
-                typeof s === "string"
-                  ? s
-                  : s.seatId || s.label || s.seat
-              )
-              .join(", ")
+            .map((s) =>
+              typeof s === "string"
+                ? s
+                : s.seatId || s.label || s.seat
+            )
+            .join(", ")
           : "—";
       doc.text(`Seats: ${seats}`);
       doc.moveDown(0.8);
