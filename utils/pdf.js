@@ -259,94 +259,142 @@ function generateItineraryPDF(booking) {
 }
 
 /**
- * NEW: generateCancellationInvoicePDF(booking, { cancellationFeeMajor, refundMajor, refundRaw })
- * - produces a small invoice that explicitly shows cancellation fee and refund amount
- * - amounts are in major units (rupees). If null, shows 0.
+ * generateCancellationInvoicePDF(booking)
+ * User-friendly cancellation / refund invoice (NO raw JSON)
  */
-function generateCancellationInvoicePDF(booking, { cancellationFeeMajor = 0, refundMajor = 0, refundRaw = null } = {}) {
+function generateCancellationInvoicePDF(booking) {
   return new Promise((resolve, reject) => {
     try {
-      const b = (booking && typeof booking.toObject === 'function') ? booking.toObject() : (booking || {});
-      const currency = (b.price && b.price.currency) ? b.price.currency : 'INR';
-      const doc = new PDFDocument({ size: 'A4', margin: 40 });
-      const chunks = [];
-      doc.on('data', (c) => chunks.push(c));
-      doc.on('end', () => resolve(Buffer.concat(chunks)));
+      const b =
+        booking && typeof booking.toObject === "function"
+          ? booking.toObject()
+          : booking || {};
 
-      // Header
-      doc.fontSize(18).font('Helvetica-Bold').text('Cancellation Invoice', { align: 'center' });
-      doc.moveDown(0.4);
-      doc.fontSize(10).font('Helvetica').text(`Booking Reference: ${b.bookingRef || '—'}`, { align: 'left' });
-      doc.text(`Cancelled: ${b.cancelledAt ? new Date(b.cancelledAt).toLocaleString() : new Date().toLocaleString()}`);
+      const currency = b.price?.currency || "INR";
+      const pb = computePriceBreakdown(b);
+
+      const totalPaid = pb.total || 0;
+      const cancellationFee = Number(b.cancellationFeeMajor || 0);
+      const refundAmount = Math.max(0, totalPaid - cancellationFee);
+
+      // try to extract a Stripe-like refund object (if present)
+      const refund =
+        b.refund ||
+        b.refundInfo ||
+        b.refundResult ||
+        b.rawRefund ||
+        null;
+
+      const refundId = refund?.id || "—";
+      const refundStatus = refund?.status || "initiated";
+      const refundCreated =
+        refund?.created
+          ? new Date(refund.created * 1000)
+          : b.cancelledAt
+          ? new Date(b.cancelledAt)
+          : new Date();
+
+      const doc = new PDFDocument({ size: "A4", margin: 40 });
+      const chunks = [];
+
+      doc.on("data", (c) => chunks.push(c));
+      doc.on("end", () => resolve(Buffer.concat(chunks)));
+
+      /* ---------- HEADER ---------- */
+      doc.fontSize(18).font("Helvetica-Bold").text("Cancellation Invoice", {
+        align: "center",
+      });
       doc.moveDown(0.6);
 
-      // Customer
-      doc.fontSize(11).font('Helvetica-Bold').text('Customer');
-      doc.moveDown(0.1);
-      doc.fontSize(10).font('Helvetica');
-      doc.text(`Name: ${b.contact?.name || '—'}`);
-      doc.text(`Email: ${b.contact?.email || '—'}`);
-      doc.moveDown(0.4);
+      doc.fontSize(10).font("Helvetica");
+      doc.text(`Booking Reference: ${b.bookingRef || "—"}`);
+      doc.text(`Cancelled On: ${refundCreated.toLocaleString()}`);
+      doc.moveDown(1);
 
-      // Flight & passenger summary
-      doc.fontSize(11).font('Helvetica-Bold').text('Booking Summary');
-      doc.moveDown(0.1);
-      doc.fontSize(10).font('Helvetica');
-      doc.text(`Flight ID: ${b.flightId || '—'}`);
-      doc.text(`Passengers: ${Array.isArray(b.passengers) ? b.passengers.length : 0}`);
-      const seats = (Array.isArray(b.seats) && b.seats.length) ? b.seats.map(s => (typeof s === 'string' ? s : (s.seatId || s.label || s.seat))).join(', ') : '—';
-      doc.text(`Seats: ${seats}`);
-      doc.moveDown(0.4);
-
-      // Price breakdown and cancellation values
-      const pb = computePriceBreakdown(b);
-      const totalPaid = pb.total || 0;
-      const cancellationFee = Number(cancellationFeeMajor || 0);
-      const refund = Number(refundMajor || 0);
-
-      doc.fontSize(11).font('Helvetica-Bold').text('Amount details');
+      /* ---------- CUSTOMER ---------- */
+      doc.fontSize(12).font("Helvetica-Bold").text("Customer");
       doc.moveDown(0.2);
-      doc.fontSize(10).font('Helvetica');
+      doc.fontSize(10).font("Helvetica");
+      doc.text(`Name: ${b.contact?.name || "—"}`);
+      doc.text(`Email: ${b.contact?.email || "—"}`);
+      doc.moveDown(0.8);
+
+      /* ---------- BOOKING SUMMARY ---------- */
+      doc.fontSize(12).font("Helvetica-Bold").text("Booking Summary");
+      doc.moveDown(0.2);
+      doc.fontSize(10).font("Helvetica");
+      doc.text(`Flight ID: ${b.flightId || "—"}`);
+      doc.text(
+        `Passengers: ${
+          Array.isArray(b.passengers) ? b.passengers.length : 0
+        }`
+      );
+      const seats =
+        Array.isArray(b.seats) && b.seats.length
+          ? b.seats
+              .map((s) =>
+                typeof s === "string"
+                  ? s
+                  : s.seatId || s.label || s.seat
+              )
+              .join(", ")
+          : "—";
+      doc.text(`Seats: ${seats}`);
+      doc.moveDown(0.8);
+
+      /* ---------- AMOUNT DETAILS ---------- */
+      doc.fontSize(12).font("Helvetica-Bold").text("Amount Details");
+      doc.moveDown(0.3);
+      doc.fontSize(10).font("Helvetica");
+
       const labelX = doc.x;
       const valueX = doc.page.width - doc.page.margins.right - 160;
-      doc.text('Total paid:', labelX, doc.y, { continued: true });
+
+      doc.text("Total paid:", labelX, doc.y, { continued: true });
       doc.text(formatMoneyMajor(totalPaid, currency), valueX, doc.y);
       doc.moveDown(0.2);
-      doc.text('Cancellation fee:', labelX, doc.y, { continued: true });
-      doc.text(formatMoneyMajor(cancellationFee, currency), valueX, doc.y);
+
+      doc.text("Cancellation fee:", labelX, doc.y, { continued: true });
+      doc.text(
+        formatMoneyMajor(cancellationFee, currency),
+        valueX,
+        doc.y
+      );
       doc.moveDown(0.2);
-      doc.text('Refund amount:', labelX, doc.y, { continued: true });
-      doc.text(formatMoneyMajor(refund, currency), valueX, doc.y);
-      doc.moveDown(0.6);
 
-      // Per-passenger listing
-      if (Array.isArray(b.passengers) && b.passengers.length) {
-        doc.fontSize(11).font('Helvetica-Bold').text('Passengers');
-        doc.moveDown(0.2);
-        doc.fontSize(9).font('Helvetica');
-        b.passengers.forEach((p, idx) => {
-          const name = [p.title, p.firstName, p.lastName].filter(Boolean).join(' ').trim() || (p.name || `Passenger ${idx + 1}`);
-          doc.text(`${idx + 1}. ${name} — Seat: ${((b.seats && b.seats[idx]) ? (typeof b.seats[idx] === 'string' ? b.seats[idx] : (b.seats[idx].label || b.seats[idx].seatId || b.seats[idx].seat)) : (p.seat || '-'))}`);
-        });
-        doc.moveDown(0.4);
-      }
+      doc.font("Helvetica-Bold")
+        .text("Refund amount:", labelX, doc.y, { continued: true });
+      doc.text(
+        formatMoneyMajor(refundAmount, currency),
+        valueX,
+        doc.y
+      );
+      doc.font("Helvetica");
+      doc.moveDown(0.8);
 
-      // Refund diagnostic (small)
-      if (refundRaw) {
-        doc.fontSize(10).font('Helvetica-Bold').text('Refund (server response)');
-        doc.moveDown(0.1);
-        doc.fontSize(8).font('Helvetica');
-        const smallText = typeof refundRaw === 'string' ? refundRaw : JSON.stringify(refundRaw, null, 2);
-        // ensure not too large
-        const preview = smallText.length > 1200 ? smallText.slice(0, 1200) + '... (truncated)' : smallText;
-        doc.text(preview, { width: doc.page.width - doc.page.margins.left - doc.page.margins.right });
-        doc.moveDown(0.4);
-      }
+      /* ---------- REFUND DETAILS ---------- */
+      doc.fontSize(12).font("Helvetica-Bold").text("Refund Details");
+      doc.moveDown(0.3);
+      doc.fontSize(10).font("Helvetica");
 
-      // Footer
-      doc.moveDown(0.6);
-      doc.fontSize(9).font('Helvetica').text('If you have questions, contact support@example.com', { align: 'left' });
-      doc.text(`Generated: ${new Date().toLocaleString()}`, { align: 'left' });
+      doc.text(`Refund ID: ${refundId}`);
+      doc.text(`Refund Status: ${refundStatus}`);
+      doc.text("Refund Method: Original payment method");
+      doc.text("Expected Credit: 5–7 business days");
+
+      doc.moveDown(1.2);
+
+      /* ---------- FOOTER ---------- */
+      doc.fontSize(9)
+        .fillColor("gray")
+        .text(
+          "If you have any questions regarding this refund, please contact support@example.com",
+          { align: "center" }
+        );
+      doc.moveDown(0.4);
+      doc.text(`Generated: ${new Date().toLocaleString()}`, {
+        align: "center",
+      });
 
       doc.end();
     } catch (err) {
@@ -354,5 +402,6 @@ function generateCancellationInvoicePDF(booking, { cancellationFeeMajor = 0, ref
     }
   });
 }
+
 
 module.exports = { generateItineraryPDF, generateCancellationInvoicePDF };

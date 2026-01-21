@@ -60,8 +60,22 @@ exports.getBooking = async (req, res) => {
  */
 exports.adminCancelBooking = async (req, res, next) => {
   try {
+    const { id } = req.params;
+
+    const booking = mongoose.isValidObjectId(id)
+      ? await Booking.findById(id)
+      : await Booking.findOne({ bookingRef: id });
+
+    if (!booking) {
+      return res.status(404).json({ ok: false, error: 'Booking not found' });
+    }
+
+    // 🔑 Admin logic: refund ONLY if payment actually happened
+    const shouldRefund =
+      booking.paymentStatus === 'PAID' && Boolean(booking.paymentIntentId);
+
     req.body = {
-      refund: true,
+      refund: shouldRefund,
       restoreInventory: true,
       reason: 'Cancelled by admin',
       adminForce: true
@@ -73,6 +87,7 @@ exports.adminCancelBooking = async (req, res, next) => {
     res.status(500).json({ ok: false, error: 'server error' });
   }
 };
+
 
 exports.retryTicketing = async (req, res) => {
   const booking = await Booking.findById(req.params.id);

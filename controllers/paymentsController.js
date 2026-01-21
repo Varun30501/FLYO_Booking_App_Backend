@@ -5,6 +5,7 @@ const Booking = require('../models/Booking');
 const mongoose = require('mongoose');
 const { v4: uuidv4 } = require('uuid');
 
+
 const STRIPE_SECRET = process.env.STRIPE_SECRET_KEY || '';
 const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || process.env.STRIPE_ENDPOINT_SECRET || '';
 const stripe = STRIPE_SECRET ? StripeLib(STRIPE_SECRET) : null;
@@ -325,6 +326,7 @@ async function refundPaymentHelper({ bookingIdentifier, chargeId, paymentIntentI
       }
 
       await booking.save();
+
     }
   } catch (err) {
     console.warn('[payments.refund] failed to persist refund to booking (non-fatal)', err && err.message);
@@ -460,19 +462,8 @@ exports.createCheckoutSession = async (req, res) => {
     //  1) explicit body.amount override (developer)
     //  2) booking.seatsMeta sum (authoritative)
     //  3) booking.price.amount (fallback)
-    let majorAmountCandidate = null;
-
-    if (typeof amount !== 'undefined' && amount !== null) {
-      majorAmountCandidate = parseMajorAmount(amount);
-    } else if (booking && Array.isArray(booking.seatsMeta) && booking.seatsMeta.length) {
-      const sum = sumSeatsMetaPrice(booking.seatsMeta);
-      if (sum > 0) majorAmountCandidate = Number(sum);
-    } else if (booking && booking.price && (typeof booking.price.amount !== 'undefined' && booking.price.amount !== null)) {
-      majorAmountCandidate = parseMajorAmount(booking.price.amount);
-    }
-
-    if (!Number.isFinite(majorAmountCandidate)) {
-      return res.status(400).json({ message: 'Invalid amount provided or computed' });
+    if (!booking || !booking.price || !Number.isFinite(Number(booking.price.amount))) {
+      return res.status(400).json({ message: 'Booking price missing or invalid' });
     }
 
     // Determine taxes
@@ -670,157 +661,105 @@ exports.webhook = async (req, res) => {
     switch (event.type) {
       case 'checkout.session.completed': {
         const session = event.data.object;
-        const bookingId = session.metadata && (session.metadata.bookingId || session.metadata.booking_id);
-        const bookingRef = session.metadata && (session.metadata.bookingRef || session.metadata.booking_ref);
-        const paymentIntent = session.payment_intent || session.paymentIntent || session.payment_intent_id;
 
-        // console.log('[payments] webhook: checkout.session.completed', {
-        //   sessionId: session.id,
-        //   bookingId,
-        //   bookingRef,
-        //   paymentIntent
-        // });
+        const bookingKey =
+          session.metadata?.bookingId ||
+          session.metadata?.bookingRef ||
+          null;
 
-        let updatedBooking = null;
-
-        try {
-          if (bookingId) {
-            await Booking.findByIdAndUpdate(bookingId, {
-              $set: {
-                status: 'CONFIRMED',
-                paymentProvider: 'stripe',
-                paymentId: paymentIntent || session.id,
-                paymentIntentId: paymentIntent || session.id,
-                stripeSessionId: session.id || undefined,
-                paymentStatus: 'PAID',
-                bookingStatus: 'CONFIRMED',
-                lastReconciledAt: new Date()
-              },
-              $inc: { reconciliationAttempts: 1 }
-            });
-            updatedBooking = await Booking.findById(bookingId).lean();
-            if (updatedBooking) console.log('[payments] booking marked confirmed by bookingId', bookingId);
-          }
-
-          if (!updatedBooking && bookingRef) {
-            await Booking.findOneAndUpdate({ bookingRef }, {
-              $set: {
-                status: 'CONFIRMED',
-                paymentProvider: 'stripe',
-                paymentId: paymentIntent || session.id,
-                paymentIntentId: paymentIntent || session.id,
-                stripeSessionId: session.id || undefined,
-                paymentStatus: 'PAID',
-                bookingStatus: 'CONFIRMED',
-                lastReconciledAt: new Date()
-              },
-              $inc: { reconciliationAttempts: 1 }
-            });
-            updatedBooking = await Booking.findOne({ bookingRef }).lean();
-            if (updatedBooking) console.log('[payments] booking marked confirmed by bookingRef', bookingRef);
-          }
-
-          if (!updatedBooking) {
-            const found = await Booking.findOne({ stripeSessionId: session.id }).lean();
-            if (found) {
-              await Booking.updateOne({ _id: found._id }, {
-                $set: {
-                  status: 'CONFIRMED',
-                  paymentProvider: 'stripe',
-                  paymentId: paymentIntent || session.id,
-                  paymentIntentId: paymentIntent || session.id,
-                  paymentStatus: 'PAID',
-                  bookingStatus: 'CONFIRMED',
-                  lastReconciledAt: new Date()
-                },
-                $inc: { reconciliationAttempts: 1 }
-              });
-              updatedBooking = await Booking.findById(found._id).lean();
-              if (updatedBooking) console.log('[payments] booking marked confirmed by stripeSessionId', found._id.toString());
-            }
-          }
-
-          if (!updatedBooking && paymentIntent) {
-            const foundByPi = await Booking.findOne({ $or: [{ paymentIntentId: paymentIntent }, { paymentId: paymentIntent }] }).lean();
-            if (foundByPi) {
-              await Booking.updateOne({ _id: foundByPi._id }, {
-                $set: {
-                  status: 'CONFIRMED',
-                  paymentProvider: 'stripe',
-                  paymentId: paymentIntent,
-                  paymentIntentId: paymentIntent,
-                  stripeSessionId: session.id || undefined,
-                  paymentStatus: 'PAID',
-                  bookingStatus: 'CONFIRMED',
-                  lastReconciledAt: new Date()
-                },
-                $inc: { reconciliationAttempts: 1 }
-              });
-              updatedBooking = await Booking.findById(foundByPi._id).lean();
-              if (updatedBooking) console.log('[payments] booking marked confirmed by paymentIntent match', foundByPi._id.toString());
-            }
-          }
-
-          if (!updatedBooking) {
-            console.warn('[payments] checkout.session.completed: could not find booking for session', session.id, 'metadata:', session.metadata);
-          }
-        } catch (err) {
-          console.error('[payments] error updating booking on checkout.session.completed', err && (err.message || err));
+        if (!bookingKey) {
+          console.error('[payments] checkout.session.completed: missing bookingKey');
+          break;
         }
 
-        // send confirmation email (best-effort)
-        try {
-          const emailer = (() => { try { return require('../utils/emailer'); } catch (e) { return null; } })();
+        const booking = await Booking.findById(bookingKey)
+          || await Booking.findOne({ bookingRef: bookingKey });
 
-          // async function logEmailPreview(payload) {
-          //   if (process.env.NODE_ENV !== 'development') return;
+        if (!booking) {
+          console.error('[payments] checkout.session.completed: booking not found', bookingKey);
+          break;
+        }
 
-          //   const { to, subject, text, pdfBuffer, booking } = payload;
+        const paymentIntent =
+          session.payment_intent ||
+          session.paymentIntent ||
+          session.payment_intent_id ||
+          session.id;
 
-          //   console.log("\n================ EMAIL PREVIEW ================");
-          //   console.log("To:        ", to || "(no recipient)");
-          //   console.log("Subject:   ", subject);
-          //   console.log("Message:\n", text);
-          //   console.log("----------------------------------------------");
+        /* 1️⃣ Mark booking confirmed */
+        booking.status = 'CONFIRMED';
+        booking.bookingStatus = 'CONFIRMED';
+        booking.paymentStatus = 'PAID';
+        booking.paymentProvider = 'stripe';
+        booking.paymentIntentId = paymentIntent;
+        booking.paymentId = paymentIntent;
+        booking.stripeSessionId = session.id;
+        booking.lastReconciledAt = new Date();
 
-          //   if (booking) {
-          //     console.log("BookingRef:", booking.bookingRef);
-          //     console.log("Passenger Count:", booking.passengers?.length);
-          //     console.log("Seats:", booking.seats?.map(s => s.label || s.seatId).join(", "));
-          //     console.log("Price:", JSON.stringify(booking.price));
-          //   }
+        await booking.save();
 
-          //   console.log("PDF Attachment:", pdfBuffer ? "(attached)" : "(none)");
-          //   console.log("==============================================\n");
-          // }
+        console.log('[payments] booking marked confirmed', booking._id.toString());
 
+        /* 2️⃣ Finalize seats (AUTHORITATIVE) */
+        if (Array.isArray(booking.seats) && booking.seats.length > 0) {
+          const SeatMap = require('../models/SeatMap');
 
-          if (updatedBooking) {
-            const TO = updatedBooking?.contact?.email || "unknown@example.com";
-            const SUBJECT = `Booking Confirmed — ${updatedBooking.bookingRef}`;
-            const TEXT =
-              `Your booking ${updatedBooking.bookingRef} is confirmed.\n\n` +
-              `Flight ID: ${updatedBooking.flightId}\n` +
-              `Passengers: ${updatedBooking.passengers?.length}\n` +
-              `Seats: ${updatedBooking.seats?.map(s => s.label || s.seatId).join(', ')}\n` +
-              `Total Paid: ₹${updatedBooking.price?.amount}\n\n` +
-              `Thank you for booking with us!`;
+          const map = await SeatMap.findOne({
+            flightId: booking.flightId,
+            travelDate: booking.travelDate,
+            origin: booking.origin,
+            destination: booking.destination
+          });
 
-            if (emailer && typeof emailer.sendBookingConfirmation === 'function') {
-              try {
-                await emailer.sendBookingConfirmation(updatedBooking);
-              } catch (err) {
-                console.warn('[payments] sendBookingConfirmation failed', err?.message);
-              }
-            }
-
+          if (!map) {
+            console.error('[payments] seatMap not found for booking', {
+              bookingId: booking._id,
+              flightId: booking.flightId,
+              travelDate: booking.travelDate,
+              origin: booking.origin,
+              destination: booking.destination
+            });
+            break;
           }
-        } catch (notifyErr) {
-          console.error('[payments] post-payment notification error', notifyErr?.message);
+
+          const bookingSeatIds = new Set(
+            booking.seats.map(s =>
+              typeof s === 'string'
+                ? String(s)
+                : String(s.label || s.seatId || s.id)
+            )
+          );
+
+          let updated = false;
+
+          for (const seat of map.seats) {
+            if (!seat) continue;
+
+            const seatKey = String(seat.label || seat.seatId || seat.id);
+            if (bookingSeatIds.has(seatKey)) {
+              seat.status = 'booked';
+              seat.heldBy = null;
+              seat.holdUntil = null;
+              updated = true;
+            }
+          }
+
+          if (updated) {
+            map.markModified('seats');
+            map.updatedAt = new Date();
+            await map.save();
+            console.log('[payments] seats finalized for booking', booking._id.toString());
+          } else {
+            console.warn('[payments] no matching seats found in seatMap', {
+              bookingId: booking._id,
+              bookingSeatIds: [...bookingSeatIds]
+            });
+          }
         }
 
         break;
       }
+
 
       case 'payment_intent.succeeded': {
         const pi = event.data.object;
@@ -829,19 +768,25 @@ exports.webhook = async (req, res) => {
             const bk = await Booking.findOne({ paymentIntentId: pi.id });
             if (bk) {
               await Booking.updateOne({ _id: bk._id }, {
-                $set: { paymentStatus: 'PAID', bookingStatus: 'CONFIRMED', lastReconciledAt: new Date(), status: 'CONFIRMED', paymentProvider: 'stripe' },
+                $set: {
+                  status: 'CONFIRMED',
+                  bookingStatus: 'CONFIRMED',
+                  paymentStatus: 'PAID',
+                  lastReconciledAt: new Date(),
+                  paymentProvider: 'stripe'
+                },
                 $inc: { reconciliationAttempts: 1 }
               });
               // console.log('[payments] payment_intent.succeeded updated booking', bk._id.toString());
 
-              const updatedBooking = await Booking.findById(bk._id).lean().catch(() => null);
+              // const booking = await Booking.findById(bk._id).lean().catch(() => null);
 
               try {
                 const emailer = (() => { try { return require('../utils/emailer'); } catch (e) { return null; } })();
-                if (emailer && updatedBooking) {
+                if (emailer && booking) {
                   if (typeof emailer.sendBookingConfirmation === 'function') {
                     try {
-                      await emailer.sendBookingConfirmation(updatedBooking);
+                      await emailer.sendBookingConfirmation(booking);
                       console.log('[payments] sendBookingConfirmation invoked (payment_intent.succeeded)');
                     } catch (emErr) {
                       console.warn('[payments] sendBookingConfirmation failed', emErr && emErr.message);

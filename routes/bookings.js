@@ -30,6 +30,11 @@ router.get('/ref/:ref', bookingsCtrl.getByRef);
 
 router.get('/:id/itinerary.pdf', bookingsCtrl.downloadItineraryPDF);
 
+router.get('/:id/refund.pdf', bookingsCtrl.downloadRefundPDF);
+
+router.post('/:id/resend-refund-confirmation', bookingsCtrl.resendRefundConfirmation);
+
+
 // resend confirmation email
 router.post('/:id/resend-confirmation', async (req, res, next) => {
   try {

@@ -88,6 +88,25 @@ const BookingSchema = new mongoose.Schema({
 
   seats: [{ type: mongoose.Schema.Types.Mixed }], // strings or objects
   seatsMeta: [{ type: mongoose.Schema.Types.Mixed }], // canonical seat objects with price etc.
+  seatMapId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'SeatMap',
+    index: true
+  },
+
+  travelDate: {
+    type: String,
+    required: true
+  },
+
+  origin: { type: String, required: true },
+  destination: { type: String, required: true },
+
+  airlineCode: { type: String },
+  flightNumber: { type: String },
+
+  departureAt: { type: Date },
+  arrivalAt: { type: Date },
 
   // Addons, coupons, discounts (itemized)
   addons: { type: [AddonSchema], default: [] },

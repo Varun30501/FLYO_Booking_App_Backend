@@ -230,7 +230,9 @@ async function retryTicketing() {
   const bookings = await Booking.find({
     paymentStatus: 'PAID',
     ticketStatus: 'PENDING',
-    ticketingAttempts: { $lt: MAX_TICKET_RETRIES }
+    ticketingAttempts: { $lt: MAX_TICKET_RETRIES },
+    origin: { $exists: true },
+    destination: { $exists: true }
   }).limit(5);
 
   for (const booking of bookings) {

@@ -8,7 +8,7 @@ const Booking = require('../models/Booking'); // used only for optional sanity c
  * restoreSeatsForBooking(bookingOrBookingId, options)
  *
  * - bookingOrBookingId : booking document OR booking id/string (will attempt to fetch)
- * - options: { flightIdOverride, matchFields: ['seatId','seat','label'] }
+ * - options: { flightIdOverride, travelDate, matchFields: ['seatId','seat','label'] }
  *
  * Returns: { ok: true/false, message, restored: <number>, details: { restoredSeats: [...], notFoundSeats: [...] } }
  */
@@ -33,6 +33,13 @@ async function restoreSeatsForBooking(bookingOrBookingId, options = {}) {
 
     const flightId = options.flightIdOverride || booking.flightId || booking.flight_id;
     if (!flightId) return { ok: false, message: 'no-flightId' };
+
+    const travelDate = options.travelDate || booking.travelDate || null;
+    if (!travelDate) {
+      return { ok: false, message: 'travelDate-required-for-restore' };
+    }
+
+
 
     // build candidate seat identifiers from booking.seats and seatsMeta
     const seatIds = new Set();
@@ -63,7 +70,12 @@ async function restoreSeatsForBooking(bookingOrBookingId, options = {}) {
     const seatIdArray = Array.from(seatIds);
 
     // load seatMap for flight
-    const seatMap = await SeatMap.findOne({ flightId }).exec();
+    const seatMap = await SeatMap.findOne({
+      flightId: options.flightIdOverride || booking.flightId
+    }).exec();
+
+
+
     if (!seatMap) return { ok: false, message: 'seatmap-not-found', flightId };
 
     // mutate in-memory and save — simpler and robust than complex arrayFilters update

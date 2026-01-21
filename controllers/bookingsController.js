@@ -406,6 +406,8 @@ async function restoreSeatsForBooking(booking) {
     map.markModified('seats');
     map.updatedAt = new Date();
     await map.save();
+    console.log('🔥 seatMap SAVED', map._id);
+
 
     return {
       ok: true,
@@ -421,10 +423,6 @@ async function restoreSeatsForBooking(booking) {
     };
   }
 }
-
-
-
-
 
 async function sendCancellationEmail(booking, { cancellationFeeMajor = 0, refundMajor = 0, refundRaw = null } = {}) {
   try {
@@ -495,6 +493,14 @@ async function sendCancellationEmail(booking, { cancellationFeeMajor = 0, refund
  * - Backend persists addon & coupon normalized objects (with validation flags).
  */
 exports.create = async (req, res) => {
+  console.log('[BOOKING CREATE PAYLOAD]', {
+    origin: req.body.origin,
+    destination: req.body.destination,
+    flightId: req.body.flightId,
+    travelDate: req.body.travelDate,
+    seats: req.body.seats,
+  });
+
   try {
     const idempotencyKey = req.header('Idempotency-Key') || req.body.idempotencyKey || null;
 
@@ -512,7 +518,7 @@ exports.create = async (req, res) => {
     }
 
     const {
-      flightId,
+      flightId, origin, destination,
       passengers = [],
       contact = {},
       userId: bodyUserId,
@@ -525,6 +531,24 @@ exports.create = async (req, res) => {
       coupons = [],
       discounts = []
     } = req.body || {};
+
+    // 🔐 SeatMap v2 requires travelDate at booking creation
+    const travelDate =
+      req.body.travelDate ||
+      req.body.date ||
+      req.query.travelDate ||
+      req.query.date ||
+      null;
+
+
+    if (!travelDate) {
+      return res.status(400).json({
+        success: false,
+        message: 'travelDate is required for booking'
+      });
+    }
+
+
 
     if (!flightId) return res.status(400).json({ success: false, message: 'flightId required' });
 
@@ -549,82 +573,66 @@ exports.create = async (req, res) => {
     });
 
     // Try to get seat map if present (for validation)
-    let SeatMapModel = null;
-    try { SeatMapModel = require('../models/SeatMap'); } catch (e) { SeatMapModel = null; }
-
+    // ✅ SeatMap v2: use canonical resolver (same as seats routes)
+    // Find seatMap (date-aware but tolerant)
     let map = null;
-    if (SeatMapModel) {
-      try {
-        map = await SeatMapModel.findOne({ flightId }).exec();
-        if (!map) map = await SeatMapModel.findOne({ legacyFlightId: flightId }).exec();
-        if (!map) map = await SeatMapModel.findOne({ aliases: flightId }).exec();
-        if (!map && mongoose.Types.ObjectId.isValid(flightId)) map = await SeatMapModel.findById(mongoose.Types.ObjectId(flightId)).exec();
-      } catch (e) {
-        console.warn('[bookings] seatmap lookup error', e && e.message);
-      }
-      if (!map && SeatMapModel) {
-        // If seatmap model exists but no map found, treat as error (defensive)
-        return res.status(404).json({ success: false, message: 'Seat map not found for flightId' });
-      }
+
+    // 1️⃣ Try date-specific seatMap
+    if (travelDate) {
+      map = await SeatMap.findOne({
+        $or: [
+          { flightId },
+          { legacyFlightId: flightId },
+          { aliases: flightId },
+          { airlineCode: flightId }
+        ],
+        travelDate
+      }).exec();
+    }
+
+    // 2️⃣ Fallback: non-date seatMap
+    if (!map) {
+      map = await SeatMap.findOne({
+        $or: [
+          { flightId },
+          { legacyFlightId: flightId },
+          { aliases: flightId },
+          { airlineCode: flightId }
+        ]
+      }).exec();
+    }
+
+    if (!map) {
+      return res.status(404).json({ error: 'Seat map not found' });
+    }
+
+    // derive travelDate if missing
+    if (!travelDate && map.travelDate) {
+      travelDate = map.travelDate;
     }
 
     // If seatmap present — validate requested seats exist & not booked/held (best effort)
+    // OPTIONAL: validate seat IDs exist in SeatMap (no mutation)
     if (map) {
-      try {
-        const now = new Date();
-        // release expired holds in memory
-        map.seats.forEach((s, idx) => {
-          if (!s) return;
-          if (s.status === 'held' && s.holdUntil) {
-            const hu = new Date(s.holdUntil);
-            if (!isNaN(hu.getTime()) && hu <= now) {
-              if (typeof s.toObject === 'function') {
-                s.status = 'free'; s.heldBy = null; s.holdUntil = null;
-              } else {
-                map.seats[idx] = { ...s, status: 'free', heldBy: null, holdUntil: null };
-              }
-            }
-          }
-        });
-      } catch (e) {
-        console.warn('[bookings] release expired holds failed', e && e.message);
-      }
-
       for (const seatObj of normalizedSeats) {
         const seatId = seatObj.seatId;
-        const s = map.seats.find(x => x && (String(x.seatId) === String(seatId) || String(x.label) === String(seatId) || String(x.id) === String(seatId)));
-        if (!s) return res.status(400).json({ success: false, message: `invalid seat ${seatId}` });
-        if (s.status === 'booked') return res.status(409).json({ success: false, message: `seat ${seatId} already booked` });
-        const requester = req.userId || req.ip || null;
-        if (s.status === 'held' && s.heldBy && s.heldBy !== requester && s.heldBy !== (req.body.heldBy || null)) {
-          return res.status(409).json({ success: false, message: `seat ${seatId} held by someone else` });
+        const exists = map.seats.some(
+          s => String(s.seatId) === String(seatId)
+        );
+        if (!exists) {
+          return res.status(400).json({
+            success: false,
+            message: `invalid seat ${seatId}`
+          });
         }
       }
-
-      // mark as booked in seatmap (in-place)
-      map.seats.forEach((s, idx) => {
-        if (!s) return;
-        const match = normalizedSeats.some(ns => String(ns.seatId) === String(s.seatId) || String(ns.seatId) === String(s.label) || String(ns.seatId) === String(s.id));
-        if (match) {
-          if (typeof s.toObject === 'function') {
-            s.status = 'booked'; s.heldBy = null; s.holdUntil = null;
-          } else {
-            map.seats[idx] = { ...s, status: 'booked', heldBy: null, holdUntil: null };
-          }
-        }
-      });
-
-      try {
-        if (map.markModified) map.markModified('seats');
-        map.updatedAt = new Date();
-        await map.save();
-      } catch (e) {
-        console.error('[bookings] failed to persist seatmap changes', e && e.message);
-        return res.status(500).json({ success: false, message: 'Failed to persist seat reservation' });
-      }
-    } else {
+    }
+    else {
       console.warn('[bookings] SeatMap model not found — proceeding without seat confirmation (unsafe)');
     }
+
+
+
 
     // resolve flight meta if available
     let flight = null;
@@ -731,11 +739,15 @@ exports.create = async (req, res) => {
       }
 
       // final sanity: ensure we have per-seat prices for every seat and non-zero total (or fail)
-      const missingPriceCount = seatsMetaForSave.filter(s => !s || !Number.isFinite(Number(s.price)) || Number(s.price) <= 0).length;
-      if (seatsMetaForSave.length === 0 || (missingPriceCount > 0 && seatsMetaForSave.length > 0)) {
-        // If we ended up with incomplete per-seat prices, abort to avoid creating zero-valued bookings unintentionally
-        return res.status(400).json({ success: false, message: 'seatsMeta required in request or missing per-seat prices (server attempted fallbacks but failed)' });
+      // seatsMeta must exist, but price may be 0 in SeatMap v2 (modifier-based)
+      if (!Array.isArray(seatsMetaForSave) || seatsMetaForSave.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: 'seatsMeta required for booking'
+        });
       }
+
+
     } catch (e) {
       // unexpected sanitizer error -> fail safe
       console.error('[bookings] seatsMeta for save error', e && e.stack ? e.stack : e);
@@ -743,7 +755,20 @@ exports.create = async (req, res) => {
     }
 
     // computed total from seatsMeta (FRONTEND authoritative)
-    const computedTotalFromSeats = seatsMetaForSave.reduce((acc, s) => acc + (Number(s.price) || 0), 0);
+    // computed total from seatsMeta
+    let computedTotalFromSeats = seatsMetaForSave.reduce(
+      (acc, s) => acc + (Number(s.price) || 0),
+      0
+    );
+
+    // SeatMap v2 fallback: if seatMeta has no absolute prices,
+    // trust frontend-provided total (production behavior)
+    if (!Number.isFinite(computedTotalFromSeats) || computedTotalFromSeats <= 0) {
+      if (Number.isFinite(Number(incomingTotal)) && Number(incomingTotal) > 0) {
+        computedTotalFromSeats = Number(incomingTotal);
+      }
+    }
+
 
     // Compute addons total and normalize addons (server-authoritative lookup if Addon model exists)
     let AddonModel = null;
@@ -853,45 +878,56 @@ exports.create = async (req, res) => {
 
     // === CRITICAL: Use UI-provided seatsMeta as canonical pricing ===
     // computedTotalFromSeats already derived from seatsMetaForSave (sum of per-seat prices)
-    let computedTotal = Number(computedTotalFromSeats || 0);
+    // let computedTotal = Number(computedTotalFromSeats || 0);
 
-    // === TAX: follow UI logic: tax is 5% on (seats + addons - discounts) ===
-    const seatsSubtotal = Number(Math.round(computedTotal || 0));
-    const computedBeforeTax = Math.round(seatsSubtotal + Math.round(addonsTotal || 0) - Math.round(discountsTotal || 0));
-    let taxVal = Math.round(Math.max(0, computedBeforeTax) * 0.05);
-    // if incomingTax explicitly provided by client, prefer that as supplemental hint but do not override UI logic:
-    if (typeof incomingTax === 'number' && !Number.isNaN(incomingTax)) {
-      // Keep computed tax as authoritative; you may log difference for monitoring
-      if (Math.round(incomingTax) !== taxVal) {
-        console.warn('[bookings] incomingTax hint differs from computed tax (authoritative): incoming:', incomingTax, 'computed:', taxVal);
-      }
+
+
+    // ✅ FRONTEND-AUTHORITATIVE FINAL PRICE
+    if (!price || !Number.isFinite(Number(price.amount)) || Number(price.amount) <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid final price from frontend'
+      });
     }
 
-    const finalTotal = Number.isFinite(Number(Math.round(computedBeforeTax + (taxVal || 0)))) ? Math.round(computedBeforeTax + (taxVal || 0)) : Math.round(computedBeforeTax);
-
     const bookingPrice = {
-      amount: Number(Math.round(finalTotal || 0)),
-      currency: (currency || 'INR'),
-      tax: Number(Math.round(taxVal || 0)),
-      taxes: Number(Math.round(taxVal || 0)),
-      discount: Number(Math.round(discountsTotal || 0)),
-      addonsTotal: Number(Math.round(addonsTotal || 0)),
-      discountsTotal: Number(Math.round(discountsTotal || 0))
+      amount: Math.round(Number(price.amount)),
+      currency: currency || 'INR',
+      tax: Math.round(Number(price.tax || 0)),
+      addonsTotal: Math.round(addonsTotal || 0),
+      discountsTotal: Math.round(discountsTotal || 0)
     };
+
 
     // Persist seats in schema-compatible structure { row, col, label } and seatsMeta saved
     const seatsForSave = Array.isArray(normalizedSeats)
       ? normalizedSeats.map(ns => {
-        const seatLabel = (ns && (ns.seatId || ns.label || ns.seat || ns.id)) || String(ns || '');
-        return { row: null, col: null, label: String(seatLabel) };
+        const seatId = String(
+          ns && (ns.seatId || ns.label || ns.seat || ns.id || ns)
+        );
+
+        return {
+          row: null,
+          col: null,
+          seatId,
+          label: seatId
+        };
       })
       : [];
+
 
     // Build booking object
     const bookingData = {
       userId: finalUserId,
       flightId: flight && (flight._id || flight.id) ? (flight._id || flight.id) : flightId,
-      seatMapId: map ? map._id : null,
+      travelDate,
+      origin,
+      destination,
+      airlineCode: req.body.airlineCode,
+      flightNumber: req.body.flightNumber,
+      departureAt: req.body.departureAt,
+      arrivalAt: req.body.arrivalAt,
+      seatMapId: map._id,
       provider: (flight && flight.provider) || process.env.AIRLINE_PROVIDER || 'mock',
       providerBookingId: `MOCK-${crypto.randomBytes(4).toString('hex').toUpperCase()}`,
       passengers: normalizedPassengers,
@@ -1022,21 +1058,36 @@ exports.create = async (req, res) => {
             },
             quantity: 1
           }],
-          success_url: `${process.env.FRONTEND_URL}/booking-details/${booking.bookingRef}?payment=true`,
-          cancel_url: `${process.env.FRONTEND_URL}/booking-details/${booking.bookingRef}?payment=cancelled`,
+          success_url: `${(process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '')}/booking-details/${encodeURIComponent(booking.bookingRef)}?payment=true`,
+          cancel_url: `${(process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '')}/booking-details/${encodeURIComponent(booking.bookingRef)}?payment=cancelled`,
           metadata: {
             bookingId: booking._id.toString(),
             bookingRef: booking.bookingRef
           }
         };
 
-        // booking.stripeSessionId = session.id || booking.stripeSessionId;
-        // if (session.payment_intent) booking.paymentIntentId = session.payment_intent;
+        // ✅ ACTUALLY CREATE STRIPE SESSION
+        const session = await stripe.checkout.sessions.create(
+          booking.stripeSessionParams
+        );
+
+        // persist stripe identifiers
+        booking.stripeSessionId = session.id || booking.stripeSessionId;
+        if (session.payment_intent) {
+          booking.paymentIntentId = session.payment_intent;
+        }
+
         booking.paymentStatus = 'PENDING';
         booking.bookingStatus = booking.bookingStatus || 'PENDING';
         await booking.save();
 
-        return res.status(201).json({ success: true, booking, session: { id: session.id, url: session.url || null }, couponBreakdown: couponBreakdown || [] });
+        return res.status(201).json({
+          success: true,
+          booking,
+          session: { id: session.id, url: session.url || null },
+          couponBreakdown: couponBreakdown || []
+        });
+
       } catch (err) {
         console.error('[bookings] create session error', err && (err.stack || err));
         return res.status(201).json({ success: true, booking, providerError: err.message || 'session creation failed', couponBreakdown: couponBreakdown || [] });
@@ -1227,13 +1278,20 @@ exports.downloadItineraryPDF = async (req, res) => {
       return res.status(500).send('Failed to generate PDF');
     }
 
+    res.status(200);
+
+    // 🔒 Force binary response (critical)
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader(
       'Content-Disposition',
-      `attachment; filename=${booking.bookingRef || 'itinerary'}.pdf`
+      `attachment; filename="${booking.bookingRef || 'itinerary'}.pdf"`
     );
+    res.setHeader('Content-Length', pdfBuffer.length);
+    res.setHeader('Cache-Control', 'no-store');
 
-    res.send(pdfBuffer);
+    // ❗ IMPORTANT: send buffer as-is, no encoding
+    res.end(pdfBuffer);
+
   } catch (err) {
     console.error('[bookings] downloadItineraryPDF error', err);
     res.status(500).send('server error');
@@ -1258,8 +1316,11 @@ exports.cancel = async (req, res, next) => {
   try {
     const id = req.params.id;
     const body = req.body || {};
-
-    const doRefund = body.refund !== false;
+    const adminForce = body.adminForce === true;
+    const doRefund =
+      body.refund === true &&
+      booking?.paymentStatus === 'PAID' &&
+      Boolean(booking?.paymentIntentId);
     const restoreInventory = body.restoreInventory !== false;
     const reason = body.reason || 'cancelled';
     const caller = req.userId || req.ip || 'unknown';
@@ -1289,7 +1350,14 @@ exports.cancel = async (req, res, next) => {
     booking.cancelledAt = new Date();
     booking.bookingStatus = 'CANCELLED';
     booking.status = 'CANCELLED';
-    booking.paymentStatus = 'CANCELLED_PENDING_REFUND';
+    if (doRefund) {
+      booking.paymentStatus = 'CANCELLED_PENDING_REFUND';
+    } else {
+      booking.paymentStatus =
+        booking.paymentStatus === 'PAID'
+          ? booking.paymentStatus
+          : 'CANCELLED';
+    }
 
     booking.rawProviderResponse = booking.rawProviderResponse || {};
     booking.rawProviderResponse.cancelledBy = caller;
@@ -1320,7 +1388,10 @@ exports.cancel = async (req, res, next) => {
     // 4️⃣ Restore seats (FIXED)
     let seatRestore = null;
     if (restoreInventory) {
-      seatRestore = await restoreSeatsForBooking(booking);
+      seatRestore = await restoreSeatsForBooking(booking, {
+        travelDate: booking.travelDate
+      });
+
     }
 
     const updatedBooking = await Booking.findById(booking._id).lean();
@@ -1329,8 +1400,8 @@ exports.cancel = async (req, res, next) => {
     try {
       await sendCancellationEmail(booking, {
         cancellationFeeMajor,
-        refundMajor,
-        refundRaw: refundResult?.refund || null
+        refundMajor: doRefund ? refundMajor : 0,
+        refundRaw: doRefund ? refundResult?.refund || null : null
       });
       console.log(
         '[bookings.cancel] cancellation email triggered for',
@@ -1415,5 +1486,76 @@ exports.getCancellationPolicy = async (req, res, next) => {
   } catch (err) {
     console.error('[bookings.getCancellationPolicy] err', err && (err.stack || err));
     return next(err);
+  }
+};
+
+exports.downloadRefundPDF = async (req, res) => {
+  try {
+    const id = req.params.id;
+    if (!id) return res.status(400).send('booking id required');
+
+    let booking = null;
+
+    if (mongoose.isValidObjectId(id)) {
+      booking = await Booking.findById(id);
+    }
+    if (!booking) {
+      booking = await Booking.findOne({ bookingRef: id });
+    }
+    if (!booking) {
+      return res.status(404).send('booking not found');
+    }
+
+    if (!booking.paymentStatus || !String(booking.paymentStatus).includes('REFUND')) {
+      return res.status(400).send('No refund available for this booking');
+    }
+
+    const pdfBuffer = await pdfUtils.generateCancellationInvoicePDF(booking);
+
+    if (!Buffer.isBuffer(pdfBuffer)) {
+      return res.status(500).send('Failed to generate refund PDF');
+    }
+
+    res.status(200);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="refund-${booking.bookingRef}.pdf"`
+    );
+    res.setHeader('Content-Length', pdfBuffer.length);
+    res.setHeader('Cache-Control', 'no-store');
+
+    return res.end(pdfBuffer);
+  } catch (err) {
+    console.error('[bookings] downloadRefundPDF error', err);
+    res.status(500).send('server error');
+  }
+};
+
+exports.resendRefundConfirmation = async (req, res) => {
+  try {
+    const id = req.params.id;
+
+    let booking = null;
+    if (mongoose.isValidObjectId(id)) {
+      booking = await Booking.findById(id);
+    }
+    if (!booking) {
+      booking = await Booking.findOne({ bookingRef: id });
+    }
+    if (!booking) {
+      return res.status(404).json({ message: 'Booking not found' });
+    }
+
+    if (!String(booking.paymentStatus || '').includes('REFUND')) {
+      return res.status(400).json({ message: 'Booking is not refunded' });
+    }
+
+    await sendRefundConfirmationEmail(booking);
+
+    return res.json({ ok: true, message: 'Refund confirmation email sent' });
+  } catch (err) {
+    console.error('[bookings] resendRefundConfirmation error', err);
+    res.status(500).json({ message: 'Failed to resend refund email' });
   }
 };

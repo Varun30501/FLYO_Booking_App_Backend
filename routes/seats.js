@@ -11,107 +11,145 @@ const mongoose = require('mongoose');
  * - avoids calling toObject() on plain objects
  * - marks seats modified if replaced with plain objects
  */
+
+// function extractTravelDate(req) {
+//   return (
+//     req.query?.date ||
+//     req.body?.date ||
+//     req.body?.travelDate ||
+//     null
+//   );
+// }
+
+function extractTravelDate(req) {
+  return req.query?.date || req.body?.travelDate || null;
+}
+
 async function releaseExpiredHolds(map) {
   const now = new Date();
   let changed = false;
 
-  if (!map || !Array.isArray(map.seats)) return map;
+  if (!map || !Array.isArray(map.seats)) return { map, changed };
 
-  map.seats.forEach((s, idx) => {
-    try {
-      if (!s) return;
-      const status = s.status;
-      const holdUntil = s.holdUntil;
-      if (status === 'held' && holdUntil) {
-        const hu = new Date(holdUntil);
-        if (!isNaN(hu.getTime()) && hu <= now) {
-          // preserve existing shape, but use safe conversion if subdoc present
-          const base = (typeof s.toObject === 'function') ? s.toObject() : { ...s };
-          base.status = 'free';
-          base.heldBy = null;
-          base.holdUntil = null;
-          map.seats[idx] = base;
-          changed = true;
-        }
+  map.seats.forEach((s) => {
+    if (!s) return;
+    if (s.status === 'held' && s.holdUntil) {
+      if (new Date(s.holdUntil) <= now) {
+        s.status = 'free';
+        s.heldBy = null;
+        s.holdUntil = null;
+        changed = true;
       }
-    } catch (e) {
-      // defensive logging — won't break flow
-      console.error('[releaseExpiredHolds] skip seat update error', e);
     }
   });
 
-  if (changed) {
-    try { map.markModified && map.markModified('seats'); } catch (e) { /* ignore */ }
-    map.updatedAt = new Date();
-    await map.save();
-  }
-
-  return map;
+  return { map, changed };
 }
 
-// Helpers: robust seatmap lookup by many keys
-async function findSeatMapByKey(key) {
-  if (!key) return null;
-
-  // 1) direct: flightId
-  let map = await SeatMap.findOne({ flightId: key }).exec();
-  if (map) return map;
-
-  // 2) legacy flightId
-  map = await SeatMap.findOne({ legacyFlightId: key }).exec();
-  if (map) return map;
-
-  // 3) aliases
-  map = await SeatMap.findOne({ aliases: key }).exec();
-  if (map) return map;
-
-  // 4) airlineCode (NEW — IMPORTANT)
-  map = await SeatMap.findOne({ airlineCode: key }).exec();
-  if (map) return map;
-
-  // 5) numeric airline ID mapping (optional)
-  if (/^\d+$/.test(key)) {
-    map = await SeatMap.findOne({ airlineNumeric: Number(key) }).exec();
-    if (map) return map;
-  }
-
-  // 6) _id lookup
-  if (mongoose.Types.ObjectId.isValid(key)) {
-    map = await SeatMap.findOne({ _id: mongoose.Types.ObjectId(key) }).exec();
-    if (map) return map;
-  }
-
-  return null;
-}
 
 // GET seat map
 router.get('/:flightId', async (req, res) => {
-  const { flightId } = req.params;
   try {
-    // try multiple lookup strategies so seatmaps can be found by different ids/aliases
-    const map = await findSeatMapByKey(flightId);
-    if (!map) return res.status(404).json({ error: 'Seat map not found' });
+    const { flightId } = req.params;
+    const travelDate = extractTravelDate(req);
+    const { origin, destination } = req.query;
 
-    await releaseExpiredHolds(map);
+    if (!travelDate) {
+      return res.status(400).json({ error: 'travelDate is required' });
+    }
 
-    // return simplified view
+    if (!origin || !destination) {
+      return res.status(400).json({
+        error: 'origin and destination are required'
+      });
+    }
+
+    // 1️⃣ Try exact seatMap first (instance)
+    let map = await SeatMap.findOne({
+      flightId: String(flightId),
+      travelDate,
+      origin,
+      destination
+    });
+
+    // 2️⃣ If not found → clone from template
+    if (!map) {
+      const template = await SeatMap.findOne({
+        flightId: String(flightId)
+      })
+        .sort({ updatedAt: -1 })
+        .lean();
+
+      if (!template) {
+        return res.status(404).json({
+          success: false,
+          message: `Seat map template not found for flight ${flightId}`
+        });
+      }
+
+      map = await SeatMap.create({
+        // identity
+        flightId: template.flightId,
+
+        // route identity (NEW for v3)
+        origin,
+        destination,
+        travelDate,
+
+        // static flight data
+        airline: template.airline,
+        airlineCode: template.airlineCode,
+        departsAt: template.departsAt,
+
+        // layout
+        rows: template.rows,
+        cols: template.cols,
+        layoutMeta: template.layoutMeta,
+        aliases: template.aliases,
+
+        // seats (reset state)
+        seats: (template.seats || []).map(s => ({
+          ...s,
+          status: 'free',
+          heldBy: null,
+          holdUntil: null
+        })),
+
+        createdAt: new Date(),
+        updatedAt: new Date()
+      });
+    }
+
+    // 3️⃣ Cleanup expired holds
+    const { map: safeMap } = await releaseExpiredHolds(map);
+
     return res.json({
       ok: true,
-      flightId: map.flightId,
-      rows: map.rows,
-      cols: map.cols,
-      seats: map.seats,
-      layoutMeta: map.layoutMeta
+      flightId: safeMap.flightId,
+      travelDate: safeMap.travelDate,
+      origin: safeMap.origin,
+      destination: safeMap.destination,
+      rows: safeMap.rows,
+      cols: safeMap.cols,
+      seats: safeMap.seats,
+      layoutMeta: safeMap.layoutMeta
     });
+
   } catch (err) {
-    console.error('[seats GET]', err);
-    return res.status(500).json({ error: 'server error' });
+    console.error('[seats.get] error', err);
+    return res.status(500).json({ error: 'failed to load seat map' });
   }
 });
+
 
 // POST hold seats (in-place updates; defensive)
 // Body: { seats: ["1A","1B"], holdMinutes: 10, heldBy: "user-id-or-ip" }
 router.post('/:flightId/hold', async (req, res) => {
+  // const { date } = req.query;
+  // if (!date) {
+  //   return res.status(400).json({ error: 'travelDate is required' });
+  // }
+
   const { flightId } = req.params;
   const payload = req.body || {};
   const seats = Array.isArray(payload.seats) ? payload.seats : [];
@@ -123,7 +161,59 @@ router.post('/:flightId/hold', async (req, res) => {
 
   try {
     // find seatmap via flexible keys (flightId could be airline code, _id, etc.)
-    const map = await findSeatMapByKey(flightId);
+    // Try to get travelDate from request
+    let travelDate = extractTravelDate(req);
+
+    // Find seatMap (date-aware but tolerant)
+    // Find seatMap (date-aware but tolerant)
+    let map = null;
+
+    // 1️⃣ Try date-specific seatMap
+    // 
+
+    if (!travelDate) {
+      return res.status(400).json({ error: 'travelDate is required' });
+    }
+
+    const origin = req.query?.origin || req.body?.origin || null;
+    const destination = req.query?.destination || req.body?.destination || null;
+
+    if (!origin || !destination) {
+      return res.status(400).json({
+        error: 'origin and destination are required'
+      });
+    }
+
+    map = await SeatMap.findOne({
+      flightId,
+      travelDate,
+      origin,
+      destination
+    }).exec();
+
+    if (!map) {
+      return res.status(404).json({
+        error: 'Seat map not found for selected date'
+      });
+    }
+
+
+    if (!map) {
+      return res.status(404).json({ error: 'Seat map not found' });
+    }
+
+    // derive travelDate if missing
+    if (!travelDate && map.travelDate) {
+      travelDate = map.travelDate;
+    }
+
+
+    // 🔧 If request did not send travelDate, derive it from seatMap
+    if (!travelDate && map.travelDate) {
+      travelDate = map.travelDate;
+    }
+
+
     if (!map) return res.status(404).json({ error: 'Seat map not found' });
 
     // release expired holds first (defensive)
@@ -144,7 +234,11 @@ router.post('/:flightId/hold', async (req, res) => {
     const holdUntil = new Date(now.getTime() + Math.max(1, Number(holdMinutes)) * 60 * 1000);
 
     // --- RACE AVOIDANCE: re-fetch latest doc right before applying changes and re-check statuses ---
-    const fresh = await SeatMap.findOne({ _id: map._id }).exec();
+    const fresh = await SeatMap.findOne({
+      _id: map._id,
+      travelDate
+    }).exec();
+
     if (!fresh) return res.status(500).json({ error: 'Seat map vanished' });
 
     // ensure none of the seats are now booked or held by someone else
@@ -186,135 +280,11 @@ router.post('/:flightId/hold', async (req, res) => {
   }
 });
 
-// POST confirm (book) seats - marks seats as booked and optionally creates a Booking
 router.post('/:flightId/confirm', async (req, res) => {
-  const { flightId } = req.params;
-  const { seats = [], heldBy: claimedHeldBy, bookingPayload = {} } = req.body || {};
-  if (!Array.isArray(seats) || seats.length === 0) return res.status(400).json({ error: 'seats required' });
-
-  try {
-    // find seat map
-    const map = await findSeatMapByKey(flightId);
-    if (!map) return res.status(404).json({ error: 'Seat map not found' });
-
-    // in-memory release expired holds (do not persist yet)
-    try {
-      const now = new Date();
-      let changed = false;
-      map.seats.forEach((s, idx) => {
-        if (!s) return;
-        if (s.status === 'held' && s.holdUntil) {
-          const hu = new Date(s.holdUntil);
-          if (!isNaN(hu.getTime()) && hu <= now) {
-            if (typeof s.toObject === 'function') {
-              s.status = 'free';
-              s.heldBy = null;
-              s.holdUntil = null;
-            } else {
-              map.seats[idx] = { ...s, status: 'free', heldBy: null, holdUntil: null };
-            }
-            changed = true;
-          }
-        }
-      });
-      if (changed) {
-        try { map.markModified && map.markModified('seats'); } catch (e) { }
-      }
-    } catch (e) {
-      console.error('[seats CONFIRM] in-memory release failed', e);
-    }
-
-    // quick validation before re-check
-    for (const seatId of seats) {
-      const s = map.seats.find(x => x && x.seatId === seatId);
-      if (!s) return res.status(400).json({ error: `invalid seat ${seatId}` });
-      if (s.status === 'booked') return res.status(409).json({ error: `seat ${seatId} already booked` });
-      if (s.status === 'held' && claimedHeldBy && s.heldBy !== claimedHeldBy) {
-        return res.status(409).json({ error: `seat ${seatId} held by someone else` });
-      }
-    }
-
-    // --- RACE AVOIDANCE: re-fetch fresh doc and re-validate prior to saving ---
-    const fresh = await SeatMap.findOne({ _id: map._id }).exec();
-    if (!fresh) return res.status(500).json({ error: 'Seat map vanished' });
-
-    // release expired holds on fresh as well
-    try {
-      const now = new Date();
-      fresh.seats.forEach((s, idx) => {
-        if (!s) return;
-        if (s.status === 'held' && s.holdUntil) {
-          const hu = new Date(s.holdUntil);
-          if (!isNaN(hu.getTime()) && hu <= now) {
-            if (typeof s.toObject === 'function') {
-              s.status = 'free';
-              s.heldBy = null;
-              s.holdUntil = null;
-            } else {
-              fresh.seats[idx] = { ...s, status: 'free', heldBy: null, holdUntil: null };
-            }
-          }
-        }
-      });
-    } catch (e) {
-      console.error('[seats CONFIRM] fresh release failed', e);
-    }
-
-    // final validation - ensure seats are still available or held by claimant
-    for (const seatId of seats) {
-      const s = fresh.seats.find(x => x && x.seatId === seatId);
-      if (!s) return res.status(400).json({ error: `invalid seat ${seatId}` });
-      if (s.status === 'booked') return res.status(409).json({ error: `seat ${seatId} already booked` });
-      if (s.status === 'held' && claimedHeldBy && s.heldBy !== claimedHeldBy) {
-        return res.status(409).json({ error: `seat ${seatId} held by someone else` });
-      }
-      if (s.status === 'held' && !claimedHeldBy && s.heldBy) {
-        // if client didn't supply heldBy but seat is held by other, reject
-        return res.status(409).json({ error: `seat ${seatId} currently held by ${s.heldBy}` });
-      }
-    }
-
-    // mark as booked
-    fresh.seats.forEach((s, idx) => {
-      if (!s) return;
-      if (seats.includes(s.seatId)) {
-        if (typeof s.toObject === 'function') {
-          s.status = 'booked';
-          s.heldBy = null;
-          s.holdUntil = null;
-        } else {
-          fresh.seats[idx] = { ...s, status: 'booked', heldBy: null, holdUntil: null };
-        }
-      }
-    });
-
-    try { fresh.markModified && fresh.markModified('seats'); } catch (e) { }
-
-    fresh.updatedAt = new Date();
-    await fresh.save(); // single atomic save on one document
-
-    // Optionally create Booking if Booking model present
-    let booking = null;
-    if (typeof Booking !== 'undefined') {
-      try {
-        booking = await Booking.create({
-          flightId,
-          seats,
-          status: 'confirmed',
-          createdAt: new Date(),
-          ...bookingPayload
-        });
-      } catch (e) {
-        // non-fatal
-        console.warn('[seats CONFIRM] booking model create failed', e && e.message);
-      }
-    }
-
-    return res.json({ ok: true, seats, booking: booking || null });
-  } catch (err) {
-    console.error('[seats CONFIRM] uncaught', err);
-    return res.status(500).json({ error: 'server error', message: err.message });
-  }
+  return res.status(410).json({
+    error: 'DEPRECATED',
+    message: 'Seat confirmation is handled via payment flow (SeatMap v2)'
+  });
 });
 
 // POST release seats (manual)
@@ -324,7 +294,60 @@ router.post('/:flightId/release', async (req, res) => {
   if (!Array.isArray(seats) || seats.length === 0) return res.status(400).json({ error: 'seats required' });
 
   try {
-    const map = await findSeatMapByKey(flightId);
+
+
+    let travelDate = extractTravelDate(req);
+
+    // find seatMap (date-aware but tolerant)
+    // Find seatMap (date-aware but tolerant)
+    let map = null;
+
+
+
+    if (!travelDate) {
+      return res.status(400).json({ error: 'travelDate is required' });
+    }
+
+    const origin = req.query?.origin || req.body?.origin || null;
+    const destination = req.query?.destination || req.body?.destination || null;
+
+    if (!origin || !destination) {
+      return res.status(400).json({
+        error: 'origin and destination are required'
+      });
+    }
+
+    map = await SeatMap.findOne({
+      flightId,
+      travelDate,
+      origin,
+      destination
+    }).exec();
+
+    if (!map) {
+      return res.status(404).json({
+        error: 'Seat map not found for selected date'
+      });
+    }
+
+
+    if (!map) {
+      return res.status(404).json({ error: 'Seat map not found' });
+    }
+
+    // derive travelDate if missing
+    if (!travelDate && map.travelDate) {
+      travelDate = map.travelDate;
+    }
+
+
+    // derive travelDate from seatMap if missing
+    if (!travelDate && map.travelDate) {
+      travelDate = map.travelDate;
+    }
+
+
+
     if (!map) return res.status(404).json({ error: 'Seat map not found' });
 
     let changed = false;
@@ -361,23 +384,35 @@ router.post('/:flightId/release', async (req, res) => {
 // DEBUG: inspect seat status for a flight
 router.get('/:flightId/debug', async (req, res) => {
   try {
-    const SeatMap = require('../models/SeatMap');
     const { flightId } = req.params;
 
-    const map = await SeatMap.findOne({ flightId }).lean();
-    if (!map) {
-      return res.status(404).json({ ok: false, message: 'seatmap not found' });
+    const { date } = req.query;
+
+    const query = {
+      $or: [
+        { flightId },
+        { legacyFlightId: flightId },
+        { aliases: flightId },
+        { airlineCode: flightId }
+      ]
+    };
+
+    if (date) {
+      query.travelDate = date;
     }
 
-    return res.json({
-      ok: true,
-      flightId,
-      seats: map.seats.map(s => ({
-        seatId: s.seatId,
-        status: s.status,
-        heldBy: s.heldBy || null
-      }))
-    });
+    const map = await SeatMap.findOne(query).exec();
+
+
+    if (!map) {
+      return res.status(404).json({
+        ok: false,
+        message: 'seatmap not found for this flight and date'
+      });
+    }
+
+    return res.json({ ok: true, map });
+
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
