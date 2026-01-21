@@ -493,14 +493,6 @@ async function sendCancellationEmail(booking, { cancellationFeeMajor = 0, refund
  * - Backend persists addon & coupon normalized objects (with validation flags).
  */
 exports.create = async (req, res) => {
-  console.log('[BOOKING CREATE PAYLOAD]', {
-    origin: req.body.origin,
-    destination: req.body.destination,
-    flightId: req.body.flightId,
-    travelDate: req.body.travelDate,
-    seats: req.body.seats,
-  });
-
   try {
     const idempotencyKey = req.header('Idempotency-Key') || req.body.idempotencyKey || null;
 
