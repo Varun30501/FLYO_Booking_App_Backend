@@ -757,6 +757,25 @@ exports.webhook = async (req, res) => {
           }
         }
 
+        /* 3️⃣ Send booking confirmation email (BEST-EFFORT, ONCE) */
+        try {
+          const emailer = (() => {
+            try { return require('../utils/emailer'); } catch (e) { return null; }
+          })();
+
+          if (emailer && typeof emailer.sendBookingConfirmation === 'function') {
+            await emailer.sendBookingConfirmation(booking);
+            console.log('[payments] booking confirmation email sent for', booking.bookingRef);
+          } else {
+            console.warn('[payments] emailer.sendBookingConfirmation not available');
+          }
+        } catch (emailErr) {
+          console.warn(
+            '[payments] booking confirmation email failed',
+            emailErr && (emailErr.message || emailErr)
+          );
+        }
+
         break;
       }
 
