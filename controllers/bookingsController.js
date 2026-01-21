@@ -1309,10 +1309,6 @@ exports.cancel = async (req, res, next) => {
     const id = req.params.id;
     const body = req.body || {};
     const adminForce = body.adminForce === true;
-    const doRefund =
-      body.refund === true &&
-      booking?.paymentStatus === 'PAID' &&
-      Boolean(booking?.paymentIntentId);
     const restoreInventory = body.restoreInventory !== false;
     const reason = body.reason || 'cancelled';
     const caller = req.userId || req.ip || 'unknown';
@@ -1328,6 +1324,13 @@ exports.cancel = async (req, res, next) => {
     if (!booking) {
       return res.status(404).json({ success: false, message: 'booking not found' });
     }
+
+    // 1.5️⃣ Decide refund eligibility (AFTER booking is loaded)
+    const doRefund =
+      body.refund === true &&
+      booking.paymentStatus === 'PAID' &&
+      Boolean(booking.paymentIntentId);
+
 
     if (String(booking.bookingStatus || booking.status || '').toUpperCase() === 'CANCELLED') {
       return res.status(400).json({ success: false, message: 'already-cancelled' });
