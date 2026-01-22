@@ -16,52 +16,80 @@ function formatMoneyMajor(amount, currency = 'INR') {
 function computePriceBreakdown(booking) {
   const seatsMeta = Array.isArray(booking.seatsMeta) ? booking.seatsMeta : [];
   // Seats subtotal = final seat prices (already discounted)
-  const seatsSubtotal = seatsMeta.reduce(
-    (acc, s) => acc + Number(s.price || 0),
+  // AUTHORITATIVE JOURNEY SEAT FARE
+  // Seat fares = total paid - taxes - addons + discounts
+  const totalPaid = Number(booking?.price?.amount || 0);
+  const taxMajor =
+    typeof booking?.price?.tax === 'number'
+      ? Number(booking.price.tax)
+      : typeof booking?.price?.taxes === 'number'
+        ? Number(booking.price.taxes)
+        : 0;
+
+  const addonsArr = Array.isArray(booking.addons) ? booking.addons : [];
+  const addonsTotal = addonsArr.reduce(
+    (acc, a) => acc + (Number(a.amount || 0) * (Number(a.qty || 1) || 1)),
     0
   );
+
+  let discountsTotal = 0;
+  if (Array.isArray(booking.discounts))
+    discountsTotal += booking.discounts.reduce(
+      (acc, d) => acc + Math.abs(Number(d.amount || 0)),
+      0
+    );
+  if (Array.isArray(booking.coupons))
+    discountsTotal += booking.coupons.reduce(
+      (acc, c) => acc + Math.abs(Number(c.amount || 0)),
+      0
+    );
+
+  // 🔐 THIS is the correct seat fare
+  const seatsSubtotal =
+    totalPaid - taxMajor - addonsTotal + discountsTotal;
+
+
 
   // Base/class split is no longer reliable post SeatMap v3
   const baseSubtotal = seatsSubtotal;
   const classExtras = 0;
 
 
-  // addons
-  const addonsArr = Array.isArray(booking.addons) ? booking.addons : [];
-  const addonsTotal = addonsArr.reduce((acc, a) => acc + (Number(a.amount || 0) * (Number(a.qty || 1) || 1)), 0);
+  // // addons
+  // const addonsArr = Array.isArray(booking.addons) ? booking.addons : [];
+  // const addonsTotal = addonsArr.reduce((acc, a) => acc + (Number(a.amount || 0) * (Number(a.qty || 1) || 1)), 0);
 
-  // discounts - combine explicit discounts + coupons
-  let discountsTotal = 0;
-  if (Array.isArray(booking.discounts)) discountsTotal += booking.discounts.reduce((acc, d) => acc + Math.abs(Number(d.amount || 0)), 0);
-  if (Array.isArray(booking.coupons)) discountsTotal += booking.coupons.reduce((acc, c) => acc + Math.abs(Number(c.amount || 0)), 0);
-  if (!discountsTotal && booking.price && Number.isFinite(Number(booking.price.discount))) discountsTotal += Math.abs(Number(booking.price.discount || 0));
+  // // discounts - combine explicit discounts + coupons
+  // let discountsTotal = 0;
+  // if (Array.isArray(booking.discounts)) discountsTotal += booking.discounts.reduce((acc, d) => acc + Math.abs(Number(d.amount || 0)), 0);
+  // if (Array.isArray(booking.coupons)) discountsTotal += booking.coupons.reduce((acc, c) => acc + Math.abs(Number(c.amount || 0)), 0);
+  // if (!discountsTotal && booking.price && Number.isFinite(Number(booking.price.discount))) discountsTotal += Math.abs(Number(booking.price.discount || 0));
 
-  // tax detection
-  let taxMajor = 0;
-  if (booking.price && typeof booking.price.tax === 'number') taxMajor = Number(booking.price.tax);
-  else if (booking.price && typeof booking.price.taxes === 'number') taxMajor = Number(booking.price.taxes);
-  else if (booking.price && typeof booking.price.amount === 'number') {
-    if (seatsSubtotal + addonsTotal - discountsTotal > 0) {
-      const inferred = Number(booking.price.amount) - (seatsSubtotal + addonsTotal - discountsTotal);
-      if (Number.isFinite(inferred) && inferred >= 0) taxMajor = Math.round(inferred);
-    }
-  }
+  // // tax detection
+  // let taxMajor = 0;
+  // if (booking.price && typeof booking.price.tax === 'number') taxMajor = Number(booking.price.tax);
+  // else if (booking.price && typeof booking.price.taxes === 'number') taxMajor = Number(booking.price.taxes);
+  // else if (booking.price && typeof booking.price.amount === 'number') {
+  //   if (seatsSubtotal + addonsTotal - discountsTotal > 0) {
+  //     const inferred = Number(booking.price.amount) - (seatsSubtotal + addonsTotal - discountsTotal);
+  //     if (Number.isFinite(inferred) && inferred >= 0) taxMajor = Math.round(inferred);
+  //   }
+  // }
 
   const totalMajor = (booking.price && typeof booking.price.amount === 'number') ? Math.round(booking.price.amount) : Math.round(baseSubtotal + classExtras + addonsTotal - discountsTotal + taxMajor);
 
   return {
-    baseSubtotal: Math.round(baseSubtotal || 0),
-    classExtras: Math.round(classExtras || 0),
+    seatFares: Math.round(seatsSubtotal || 0),
     tax: Math.round(taxMajor || 0),
-    seatsSubtotal: Math.round(seatsSubtotal || 0),
     addonsTotal: Math.round(addonsTotal || 0),
     discountsTotal: Math.round(discountsTotal || 0),
-    total: Math.round(totalMajor || 0),
+    total: Math.round(totalPaid || 0),
     currency: (booking.price && booking.price.currency) || 'INR',
     addons: addonsArr,
     discountsArr: booking.discounts || [],
     coupons: booking.coupons || []
   };
+
 }
 
 /**
@@ -135,17 +163,16 @@ function generateItineraryPDF(booking) {
       const labelColX = doc.x;
       const valueColX = doc.page.width - doc.page.margins.right - 140;
 
-      doc.text('Seat fares:', labelColX, doc.y, { continued: true });
-      doc.text(formatMoneyMajor(pb.baseSubtotal, pb.currency), valueColX, doc.y);
+      doc.text('Seat fares (journey):', labelColX, doc.y, { continued: true });
+      doc.text(
+        formatMoneyMajor(pb.seatFares, pb.currency),
+        valueColX,
+        doc.y
+      );
       doc.moveDown(0.2);
 
-      doc.text('Seat adjustments / upgrades:', labelColX, doc.y, { continued: true });
-      doc.text(formatMoneyMajor(pb.classExtras, pb.currency), valueColX, doc.y);
-      doc.moveDown(0.2);
+      doc.moveDown(0.3);
 
-      doc.text('Seats total:', labelColX, doc.y, { continued: true });
-      doc.text(formatMoneyMajor(pb.seatsSubtotal, pb.currency), valueColX, doc.y);
-      doc.moveDown(0.2);
 
       if (pb.addonsTotal && pb.addonsTotal > 0) {
         doc.text('Add-ons:', labelColX, doc.y, { continued: true });
@@ -191,8 +218,11 @@ function generateItineraryPDF(booking) {
           const seatId = s.seatId || s.seat || '-';
           const cls = s.seatClass || s.class || s.category || '-';
           const priceMaj = Number(s.price || 0);
-          const extra = Number(s.priceModifier || 0);
-          const base = Math.max(0, priceMaj - extra);
+
+          // SeatMap v3: price is already final
+          const base = priceMaj;
+          const extra = 0;
+
 
           doc.text(String(seatId), colSeatX, doc.y, { continued: true });
           doc.text(String(cls), colClassX, doc.y, { continued: true });
