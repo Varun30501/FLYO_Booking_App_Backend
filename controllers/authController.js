@@ -122,7 +122,15 @@ exports.register = async (req, res) => {
         await user.save();
 
         const token = signToken(user);
-        const safeUser = { id: user._id, name: user.name, email: user.email, isAdmin: !!user.isAdmin, role: user.role || null };
+        const safeUser = {
+          id:      user._id,
+          name:    user.name || user.email,
+          email:   user.email,
+          phone:   user.phone || '',
+          profile: user.profile || {},
+          isAdmin: !!(user.isAdmin || user.role === 'admin' || user.role === 'superadmin'),
+          role:    user.role || 'user'
+        };
 
 
         res.json({ token, user: safeUser });
@@ -144,7 +152,13 @@ exports.login = async (req, res) => {
         if (!ok) return res.status(401).json({ message: 'Invalid credentials' });
 
         const token = signToken(user);
-        const safeUser = { id: user._id, name: user.name, email: user.email };
+        const safeUser = {
+          id:      user._id,
+          name:    user.name || user.email,
+          email:   user.email,
+          isAdmin: !!(user.isAdmin || user.role === 'admin' || user.role === 'superadmin'),
+          role:    user.role || 'user'
+        };
         res.json({ token, user: safeUser });
     } catch (err) {
         console.error('[auth] login error', err);

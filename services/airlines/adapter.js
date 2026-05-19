@@ -1,119 +1,166 @@
 // services/airlines/adapter.js
+// Provider cascade: Amadeus → Duffel → Mock
+// Each provider is tried in order; first non-empty result wins.
+// Failed providers are tracked and briefly circuit-broken to avoid
+// cascading latency on every request.
 'use strict';
 
-const providers = {
-  amadeus: (() => {
-    try { return require('./providers/amadeusProvider'); } catch (e) { return null; }
-  })(),
-  // add other providers here (sabreProvider, travelportProvider, localCache, etc)
+/* ── lazy-load providers ─────────────────────────────────────── */
+function tryLoad(path) {
+  try { return require(path); } catch (e) {
+    console.warn(`[adapter] could not load provider at ${path}:`, e.message);
+    return null;
+  }
+}
+
+const PROVIDERS = {
+  amadeus: tryLoad('./providers/amadeusProvider'),
+  duffel:  tryLoad('./providers/duffelProvider'),
+  mock:    tryLoad('./providers/mockProvider'),
 };
 
-async function callProviderSearch(provider, params) {
+/* ── circuit breaker state ───────────────────────────────────── */
+// After FAIL_THRESHOLD consecutive failures, skip the provider for
+// COOLDOWN_MS milliseconds before retrying.
+const FAIL_THRESHOLD = 3;
+const COOLDOWN_MS    = 60_000; // 1 minute
+
+const _health = {
+  amadeus: { failures:0, openUntil:0 },
+  duffel:  { failures:0, openUntil:0 },
+  mock:    { failures:0, openUntil:0 },
+};
+
+function isOpen(key) {
+  const h = _health[key];
+  if (!h) return true;
+  if (h.openUntil && Date.now() < h.openUntil) return false; // still in cooldown
+  return true;
+}
+function recordSuccess(key) {
+  if (_health[key]) { _health[key].failures = 0; _health[key].openUntil = 0; }
+}
+function recordFailure(key) {
+  if (!_health[key]) return;
+  _health[key].failures++;
+  if (_health[key].failures >= FAIL_THRESHOLD) {
+    _health[key].openUntil = Date.now() + COOLDOWN_MS;
+    console.warn(`[adapter] circuit open for ${key} — cooling down ${COOLDOWN_MS/1000}s`);
+  }
+}
+
+/* ── call one provider ───────────────────────────────────────── */
+async function callProvider(key, fn, params) {
+  const prov = PROVIDERS[key];
+  if (!prov || typeof fn !== 'function') {
+    return { ok:false, flights:[], diagnostic:{ provider:key, message:'provider unavailable' } };
+  }
+  if (!isOpen(key)) {
+    return { ok:false, flights:[], diagnostic:{ provider:key, message:'circuit open (cooling down)' } };
+  }
+  const ts = Date.now();
   try {
-    if (!provider || typeof provider.search !== 'function') {
-      return { ok: false, flights: [], diagnostic: { message: 'provider unavailable' } };
-    }
-    const start = Date.now();
-    const raw = await provider.search(params);
-    const duration = Date.now() - start;
-
-    // Normalize flights into array if provider returned mapped flight objects
-    const flights = Array.isArray(raw) ? raw : (raw && raw.flights ? raw.flights : (raw && raw.data && Array.isArray(raw.data) ? raw.data : []));
-
-    // If provider itself returned diagnostic shape, keep it
-    const providerDiagnostic = (raw && raw.diagnostic) ? raw.diagnostic : null;
-
+    const raw = await fn.call(prov, params);
+    // Normalise return shape
+    const flights = Array.isArray(raw) ? raw
+      : Array.isArray(raw?.flights) ? raw.flights
+      : Array.isArray(raw?.data)    ? raw.data
+      : [];
+    const ok = flights.length > 0;
+    if (ok) recordSuccess(key); else recordFailure(key);
     return {
-      ok: Array.isArray(flights),
-      flights: flights || [],
-      diagnostic: Object.assign({
-        provider: provider.providerId || provider.name || 'unknown',
-        ts: new Date().toISOString(),
-        durationMs: duration,
-        rawShape: (raw && typeof raw === 'object') ? Object.keys(raw).slice(0,6) : typeof raw
-      }, providerDiagnostic || (raw && raw.error ? { error: raw.error } : {}))
+      ok,
+      flights,
+      diagnostic: {
+        provider: key,
+        durationMs: Date.now() - ts,
+        count: flights.length,
+        ...(raw?.diagnostic || {}),
+      },
     };
   } catch (err) {
-    // Catch provider errors and return diagnostic (no throw)
+    recordFailure(key);
+    console.error(`[adapter][${key}] error:`, err.message);
     return {
-      ok: false,
-      flights: [],
-      diagnostic: {
-        provider: provider && (provider.providerId || provider.name) || 'unknown',
-        ts: new Date().toISOString(),
-        errorMessage: err && (err.message || String(err)),
-        stack: (err && err.stack) ? String(err.stack).slice(0,2000) : undefined
-      }
+      ok:false, flights:[],
+      diagnostic: { provider:key, durationMs:Date.now()-ts, errorMessage:err.message },
     };
   }
 }
 
-/**
- * search({ origin, destination, date, limit })
- * returns: { ok: boolean, flights: Array, diagnostic: Object }
- * This wrapper will try providers in preferred order and combine results.
- */
+/* ── search — cascade ────────────────────────────────────────── */
 async function search(params = {}) {
-  // Choose provider priority — here use amadeus first if available
-  const order = ['amadeus']; // add others as fallback in array
-  const aggregated = [];
+  // Order: amadeus → duffel → mock
+  const ORDER = ['amadeus', 'duffel', 'mock'];
   const diagnostics = [];
 
-  for (const pKey of order) {
-    const prov = providers[pKey];
-    if (!prov) continue;
-    const result = await callProviderSearch(prov, params);
-    diagnostics.push(result.diagnostic || { provider: pKey });
-    if (result.ok && Array.isArray(result.flights) && result.flights.length > 0) {
-      // return first successful non-empty provider results (common UX)
-      return { ok: true, flights: result.flights, diagnostic: result.diagnostic };
+  for (const key of ORDER) {
+    const prov = PROVIDERS[key];
+    if (!prov || typeof prov.search !== 'function') continue;
+
+    const result = await callProvider(key, prov.search, params);
+    diagnostics.push(result.diagnostic);
+
+    if (result.ok && result.flights.length > 0) {
+      console.log(`[adapter] ✅ ${key} returned ${result.flights.length} flights`);
+      return { ok:true, flights:result.flights, provider:key, diagnostic:result.diagnostic };
     }
-    // else continue to next provider, but keep diagnostics
+
+    console.log(`[adapter] ⏭ ${key} returned 0 flights — trying next provider`);
   }
 
-  // If no provider produced results, return combined diagnostic info
   return {
     ok: false,
     flights: [],
-    diagnostic: {
-      message: 'no provider returned flights',
-      providers: diagnostics,
-      ts: new Date().toISOString()
-    }
+    provider: null,
+    diagnostic: { message:'all providers exhausted', providers:diagnostics },
   };
 }
 
+/* ── status ──────────────────────────────────────────────────── */
 async function status() {
-  const prov = providers.amadeus;
-  if (!prov) return { ok: false, provider: 'amadeus', status: 'missing' };
-
-  const token = await (prov.getToken ? prov.getToken() : null);
-  return {
-    ok: !!token,
-    provider: 'amadeus',
-    status: token ? 'up' : 'auth_failed'
-  };
+  const out = {};
+  for (const [key, prov] of Object.entries(PROVIDERS)) {
+    if (!prov) { out[key] = { status:'not_loaded' }; continue; }
+    const h = _health[key];
+    const circuitOpen = h?.openUntil && Date.now() < h.openUntil;
+    out[key] = {
+      status: circuitOpen ? 'circuit_open' : 'ok',
+      failures: h?.failures || 0,
+      cooldownRemainingMs: circuitOpen ? h.openUntil - Date.now() : 0,
+    };
+    // For Amadeus, also check token
+    if (key === 'amadeus' && typeof prov.getToken === 'function') {
+      try {
+        const token = await prov.getToken();
+        out[key].authStatus = token ? 'token_ok' : 'auth_failed';
+      } catch { out[key].authStatus = 'auth_error'; }
+    }
+  }
+  return out;
 }
 
-async function revalidate(params) {
-  const prov = providers.amadeus;
+/* ── revalidate — try the provider that created the offer ─────── */
+async function revalidate(params = {}) {
+  const provKey = params?.offer?.provider || 'amadeus';
+  const prov    = PROVIDERS[provKey] || PROVIDERS.amadeus;
   if (!prov || typeof prov.revalidate !== 'function') {
-    return { ok: false, reason: 'provider_unavailable' };
+    return { ok:false, reason:'provider_unavailable' };
   }
   return prov.revalidate(params);
 }
 
-async function issueTicket({ booking }) {
-  const prov = providers.amadeus;
+/* ── issueTicket ─────────────────────────────────────────────── */
+async function issueTicket({ booking } = {}) {
+  const provKey = booking?.provider || 'amadeus';
+  const prov    = PROVIDERS[provKey] || PROVIDERS.amadeus;
   if (!prov || typeof prov.issueTicket !== 'function') {
-    return { ok: false, reason: 'provider_unavailable' };
+    return { ok:false, reason:'provider_unavailable' };
   }
   return prov.issueTicket({ booking });
 }
 
-module.exports = {
-  search,
-  status,
-  revalidate,
-  issueTicket
-};
+/* ── health endpoint helper ──────────────────────────────────── */
+function healthSnapshot() { return JSON.parse(JSON.stringify(_health)); }
+
+module.exports = { search, status, revalidate, issueTicket, healthSnapshot };

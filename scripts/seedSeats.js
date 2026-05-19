@@ -28,6 +28,38 @@ function seatLetters(n) {
   return arr;
 }
 
+/**
+ * Determine which rows get extra legroom / exit-row treatment.
+ * Rules (realistic airline layout):
+ *  - Row after First/Business boundary (row after seatClass changes)
+ *  - Emergency exit rows: typically ~row 12 and row 22 for a 25-row plane
+ *  - Bulkhead: row 1 and the first row of each new cabin class
+ */
+function buildExitRows(rows, cols) {
+  // For a typical layout: exit rows at ~40% and ~80% into Economy section
+  // Business ends at row 5 → Economy starts at 6 → exit at row 11 & 20 (scaled)
+  const economyStart = 11; // after First(1-2) + Business(3-5) + PremiumEco(6-10)
+  const economyRows = rows - economyStart;
+  const exit1 = economyStart + Math.floor(economyRows * 0.25); // ~25% into economy
+  const exit2 = economyStart + Math.floor(economyRows * 0.65); // ~65% into economy
+  return new Set([exit1, exit2]);
+}
+
+function seatFeatures(row, col, cols, seatClass, exitRows) {
+  const isExitRow   = exitRows.has(row);
+  const isBulkhead  = row === 1 || row === 6 || row === 11; // cabin boundaries
+  const isWindow    = col === 1 || col === cols;
+  const isAisle     = col === Math.ceil(cols / 2) || col === Math.ceil(cols / 2) + 1;
+  const extraLegroom = isExitRow || isBulkhead;
+  return {
+    extraLegroom,
+    exitRow:   isExitRow,
+    window:    isWindow,
+    aisle:     isAisle,
+    bulkhead:  isBulkhead,
+  };
+}
+
 (async function main() {
   const { flightId, rows, cols, origin, destination, airline, prefix } = parseArgs();
   const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/flight_booking_dev';
@@ -38,6 +70,7 @@ function seatLetters(n) {
 
     // Build seats
     const letters = seatLetters(cols);
+    const exitRows = buildExitRows(rows, cols);
     const seats = [];
     for (let r = 1; r <= rows; r++) {
       for (let c = 0; c < cols; c++) {
@@ -51,15 +84,18 @@ function seatLetters(n) {
         // price modifier: higher for front section
         const baseModifier = seatClass === 'First' ? 7000 : seatClass === 'Business' ? 3500 : seatClass === 'PremiumEconomy' ? 1200 : 0;
 
+        const features = seatFeatures(r, c + 1, cols, seatClass, exitRows);
+
         seats.push({
           seatId,
           row: r,
           col: c + 1,
           seatClass,
-          priceModifier: baseModifier,
+          priceModifier: baseModifier + (features.extraLegroom && seatClass === 'Economy' ? 600 : 0),
           status: 'free',
           heldBy: null,
           holdUntil: null,
+          features,
         });
       }
     }

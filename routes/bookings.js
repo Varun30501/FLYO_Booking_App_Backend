@@ -2,40 +2,37 @@
 const express = require('express');
 const router = express.Router();
 const bookingsCtrl = require('../controllers/bookingsController');
-const auth = require('../middleware/authMiddleware'); // keep your auth middleware
+const auth = require('../middleware/authMiddleware');
 
-// NOTE: Order matters.
-// /mine must come BEFORE /:id
+// NOTE: Order matters — named routes MUST come BEFORE /:id param routes.
+
+// /me  — primary endpoint the frontend tries first (MyBookings page)
+router.get('/me', auth, bookingsCtrl.listMine);
+
+// /mine — legacy alias (kept for backward compat)
 router.get('/mine', auth, bookingsCtrl.listMine);
 
 // Create booking (authenticated; controller allows guest fallback)
 router.post('/', auth, bookingsCtrl.create);
 
-// --- NEW: Cancel booking route ---
-router.get('/:id/cancellation-policy', bookingsCtrl.getCancellationPolicy);
-// Place BEFORE '/:id'
-router.post('/:id/cancel', auth, bookingsCtrl.cancel);
-
-// Public fetch by id or bookingRef
-router.get('/:id', bookingsCtrl.getOne);
-
-// Update status (partial update)
-router.post('/:id/status', auth, bookingsCtrl.updateStatus);
-
-// Legacy list by user id
+// Named sub-routes — must all be declared BEFORE /:id
 router.get('/user/:userId', bookingsCtrl.listByUser);
-
-// get by ref
 router.get('/ref/:ref', bookingsCtrl.getByRef);
 
-router.get('/:id/itinerary.pdf', bookingsCtrl.downloadItineraryPDF);
+// Cancellation policy (no auth needed)
+router.get('/:id/cancellation-policy', bookingsCtrl.getCancellationPolicy);
 
+// Cancel booking
+router.post('/:id/cancel', auth, bookingsCtrl.cancel);
+
+// Status update
+router.post('/:id/status', auth, bookingsCtrl.updateStatus);
+
+// PDF downloads
+router.get('/:id/itinerary.pdf', bookingsCtrl.downloadItineraryPDF);
 router.get('/:id/refund.pdf', bookingsCtrl.downloadRefundPDF);
 
-router.post('/:id/resend-refund-confirmation', bookingsCtrl.resendRefundConfirmation);
-
-
-// resend confirmation email
+// Email resend endpoints
 router.post('/:id/resend-confirmation', async (req, res, next) => {
   try {
     const id = req.params.id;
@@ -45,5 +42,10 @@ router.post('/:id/resend-confirmation', async (req, res, next) => {
     next(err);
   }
 });
+
+router.post('/:id/resend-refund-confirmation', bookingsCtrl.resendRefundConfirmation);
+
+// Public fetch by id or bookingRef — must be LAST
+router.get('/:id', bookingsCtrl.getOne);
 
 module.exports = router;

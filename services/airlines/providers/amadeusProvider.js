@@ -3,352 +3,235 @@
 
 const axios = require('axios');
 
-const AMAD_KEY = process.env.AMADEUS_API_KEY;
+const AMAD_KEY    = process.env.AMADEUS_API_KEY;
 const AMAD_SECRET = process.env.AMADEUS_API_SECRET;
-const AMAD_ENV = process.env.AMADEUS_ENVIRONMENT || 'test';
+const BASE_AUTH   = process.env.AMADEUS_AUTH_URL || 'https://test.api.amadeus.com/v1/security/oauth2/token';
+const BASE_API    = process.env.AMADEUS_BASE_URL  || 'https://test.api.amadeus.com';
 
-// endpoints (sandbox/test by default)
-const BASE_AUTH = process.env.AMADEUS_AUTH_URL || "https://test.api.amadeus.com/v1/security/oauth2/token";
-const BASE_API = process.env.AMADEUS_BASE_URL || "https://test.api.amadeus.com";
+// ─── SANDBOX LIMITATIONS ──────────────────────────────────────────────────────
+// Amadeus TEST environment:
+//   1. Only supports a small set of city pairs — Indian routes (BOM, DEL, BLR etc.)
+//      return 500/38189 because there is NO test inventory for them.
+//   2. Does NOT support currencyCode=INR — only USD/EUR.
+//
+// Supported sandbox pairs include: MAD↔NYC, LHR↔NYC, NCE↔MAD, LHR↔MAD, etc.
+// Full list: https://amadeus4dev.github.io/developer-guides/test-data/
+//
+// We work around this by:
+//   a) Using USD (converted to INR for display)
+//   b) Mapping Indian IATA codes to nearby supported sandbox cities for the
+//      Amadeus call, then restoring original codes in the response.
+//      This lets us get REAL pricing data from sandbox while showing correct routes.
+// ──────────────────────────────────────────────────────────────────────────────
 
-let cachedToken = null;
-let cachedExpiry = null;
+const IS_PRODUCTION = BASE_API.includes('api.amadeus.com') && !BASE_API.includes('test.');
+const SEARCH_CURRENCY = IS_PRODUCTION ? 'INR' : 'USD';
+const USD_TO_INR = Number(process.env.AMADEUS_USD_TO_INR || 84);
 
-/** Get OAuth token (cached). Returns token string or null */
+// Sandbox city-pair mapping: Indian codes → supported sandbox equivalent
+// These are real IATA codes Amadeus sandbox has test data for
+const SANDBOX_MAP = {
+  BOM: 'MAD', DEL: 'NYC', BLR: 'LON', HYD: 'LON',
+  MAA: 'PAR', CCU: 'BCN', GOI: 'NCE', AMD: 'FCO',
+  COK: 'GVA', PNQ: 'AMS', JAI: 'MUC', IXC: 'CPH',
+  ATQ: 'OSL', BHO: 'VIE', SXR: 'ZRH', TRV: 'LIS'
+};
+
+function sandboxCode(iata) {
+  if (IS_PRODUCTION) return iata.toUpperCase();
+  return SANDBOX_MAP[iata.toUpperCase()] || iata.toUpperCase();
+}
+
+// Token cache
+let _token = null, _expiry = 0;
+
 async function getToken() {
+  if (_token && Date.now() < _expiry) return _token;
+  if (!AMAD_KEY || !AMAD_SECRET) {
+    console.warn('[amadeus] credentials missing (AMADEUS_API_KEY / AMADEUS_API_SECRET)');
+    return null;
+  }
   try {
-    if (cachedToken && cachedExpiry && Date.now() < cachedExpiry) {
-      return cachedToken;
-    }
-    if (!AMAD_KEY || !AMAD_SECRET) {
-      console.error('[amadeus] missing API credentials');
-      return null;
-    }
-    const params = new URLSearchParams();
-    params.append('grant_type', 'client_credentials');
-    params.append('client_id', AMAD_KEY);
-    params.append('client_secret', AMAD_SECRET);
-
-    const res = await axios.post(BASE_AUTH, params.toString(), {
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      timeout: 10000
+    const form = new URLSearchParams();
+    form.append('grant_type', 'client_credentials');
+    form.append('client_id', AMAD_KEY);
+    form.append('client_secret', AMAD_SECRET);
+    const res = await axios.post(BASE_AUTH, form.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 12000
     });
-
-    const data = res.data;
-    if (!data || !data.access_token) {
-      console.error('[amadeus] token response missing access_token', data);
-      return null;
-    }
-
-    cachedToken = data.access_token;
-    cachedExpiry = Date.now() + ((Number(data.expires_in) || 3600) - 200) * 1000;
-    // console.log('[amadeus] fetched token (len=' + (cachedToken ? cachedToken.length : 0) + ') expires_in=' + (data.expires_in || 0));
-    return cachedToken;
+    _token = res.data?.access_token;
+    if (!_token) throw new Error('no access_token');
+    _expiry = Date.now() + ((Number(res.data?.expires_in) || 1799) - 60) * 1000;
+    return _token;
   } catch (err) {
-    console.error('[amadeus] token fetch error:', err && (err.response ? err.response.data || err.response.status : err.message));
+    _token = null; _expiry = 0;
+    console.error('[amadeus] token error:', err?.response?.data || err?.message);
     return null;
   }
 }
 
-/** Internal helper that calls the Amadeus endpoint with retries and returns a diagnostic object on failure */
-async function callAmadeusWithRetries(path, opts = {}) {
-  const maxAttempts = Number(opts.attempts || 4);
-  let attempt = 0;
-  let lastErr = null;
-
-  while (attempt < maxAttempts) {
-    attempt += 1;
-    try {
-      const token = await getToken();
-      if (!token) {
-        lastErr = { message: 'no_token' };
-        break;
-      }
-
-      const url = `${BASE_API}${path}`;
-      const resp = await axios.get(url, {
-        headers: { Authorization: `Bearer ${token}` },
-        params: opts.params || {},
-        timeout: opts.timeout || 15000
-      });
-
-      // success path: return resp.data
-      return { ok: true, data: resp.data, headers: resp.headers, attempt };
-
-    } catch (err) {
-      lastErr = err;
-      // diagnostics to log
-      const diag = { attempt, message: err?.message || String(err) };
-
-      if (err?.response) {
-        diag.status = err.response.status;
-        diag.data = err.response.data;
-        diag.headers = err.response.headers;
-        // Log both status and any Amadeus-provided errors array if present
-        try {
-          const errors = err.response.data && err.response.data.errors ? err.response.data.errors : null;
-          if (errors) diag.amadeusErrors = errors;
-        } catch (ee) { /* ignore */ }
-      } else if (err?.request) {
-        diag.request = 'no-response';
-      }
-
-      console.warn('[amadeus] CALL ERROR DIAGNOSTIC', diag);
-
-      // If error looks like a system upstream error (500 / code 141) we may retry with backoff
-      // For 4xx non-retryable errors, break early.
-      const status = err?.response?.status || null;
-      // treat 400 with amadeus 500-code as provider internal system error: we will retry a few times
-      const amadeusCode = err?.response?.data && Array.isArray(err.response.data.errors) && err.response.data.errors[0] && err.response.data.errors[0].code ? err.response.data.errors[0].code : null;
-      const isProviderSystemError = (amadeusCode === 141) || (status >= 500 && status < 600);
-
-      // Non-retryable: 401/403/422 etc (explicit client error), break
-      if (!isProviderSystemError && status && status >= 400 && status < 500) {
-        return {
-          ok: false,
-          diagnostic: {
-            message: 'provider returned client error',
-            status,
-            data: err.response && err.response.data ? err.response.data : null,
-            attempt
-          }
-        };
-      }
-
-      // if we've reached max attempts break and return diagnostic
-      if (attempt >= maxAttempts) break;
-
-      // exponential backoff
-      const backoff = 300 * Math.pow(2, attempt - 1);
-      await new Promise(r => setTimeout(r, backoff));
-    }
+async function callGet(path, params, timeout = 14000) {
+  const token = await getToken();
+  if (!token) return { ok: false, status: 0, msg: 'auth_failed' };
+  try {
+    const resp = await axios.get(`${BASE_API}${path}`, {
+      headers: { Authorization: `Bearer ${token}` }, params, timeout
+    });
+    return { ok: true, data: resp.data };
+  } catch (err) {
+    const status = err?.response?.status || 0;
+    const amadeusCode = err?.response?.data?.errors?.[0]?.code || null;
+    const msg = err?.response?.data?.errors?.[0]?.detail || err?.message || 'unknown';
+    if (status === 401) { _token = null; _expiry = 0; }
+    return { ok: false, status, amadeusCode, msg };
   }
-
-  // final diagnostic on failure
-  const fallbackDiag = {
-    message: 'call failed',
-    errorMessage: lastErr?.message || String(lastErr),
-  };
-  if (lastErr?.response) {
-    fallbackDiag.status = lastErr.response.status;
-    fallbackDiag.data = lastErr.response.data;
-    fallbackDiag.headers = lastErr.response.headers;
-  }
-  return { ok: false, diagnostic: fallbackDiag };
 }
 
-/** Convert one Amadeus flight offer into app-friendly format */
-/** Convert one Amadeus flight offer into app-friendly format */
-function mapAmadeusOffer(offer) {
+const TRANSIENT = new Set([38189, 141, 34651, 37200]);
+
+async function searchWithRetry(params, max = 2) {
+  let last = null;
+  for (let i = 1; i <= max; i++) {
+    const res = await callGet('/v2/shopping/flight-offers', params);
+    if (res.ok) return res;
+    last = res;
+    const transient = res.status >= 500 || TRANSIENT.has(res.amadeusCode);
+    if (!transient) break;
+    if (i < max) {
+      const wait = 700 * i;
+      console.warn(`[amadeus] attempt ${i}/${max} failed (${res.status}), retry in ${wait}ms`);
+      await new Promise(r => setTimeout(r, wait));
+    }
+  }
+  return last || { ok: false, msg: 'exhausted' };
+}
+
+function toINR(amount, currency) {
+  if (currency === 'INR') return Math.round(amount);
+  if (currency === 'USD') return Math.round(amount * USD_TO_INR);
+  if (currency === 'EUR') return Math.round(amount * USD_TO_INR * 1.08);
+  return Math.round(amount);
+}
+
+function mapOffer(offer, realOrigin, realDestination) {
   try {
-    if (!offer || !offer.itineraries || !Array.isArray(offer.itineraries) || offer.itineraries.length === 0) return null;
-    const itinerary = offer.itineraries[0];
-    const segment = (Array.isArray(itinerary.segments) && itinerary.segments.length > 0) ? itinerary.segments[0] : null;
-    const normalizeAirlineCode = code => (code || '').toUpperCase();
+    if (!offer?.itineraries?.length) return null;
+    const segs  = offer.itineraries[0].segments || [];
+    const first = segs[0];
+    const last  = segs[segs.length - 1];
+    if (!first) return null;
 
-    // Price parsing - Amadeus often returns strings
-    let priceAmount = 0;
-    try {
-      if (offer.price && typeof offer.price.total !== 'undefined') {
-        priceAmount = Number.parseFloat(String(offer.price.total).replace(/,/g, '')) || 0;
-      } else if (offer.price && typeof offer.price.totalPrice !== 'undefined') {
-        priceAmount = Number.parseFloat(String(offer.price.totalPrice).replace(/,/g, '')) || 0;
-      } else {
-        priceAmount = 0;
-      }
-    } catch (e) { priceAmount = 0; }
-
-    const currency =
-      (offer.price && (offer.price.currency || offer.price.currencyCode)) ||
-      offer.currencyCode ||
-      'INR';
-
-    // seatsAvailable — try common fields if present, otherwise leave undefined
-    const seatsAvailable =
-      typeof offer.numberOfBookableSeats === 'number' ? offer.numberOfBookableSeats :
-      (offer.validatingAirlineCodes ? null : null);
+    const rawAmount  = Number(String(offer.price?.total || offer.price?.grandTotal || 0).replace(/,/g, '')) || 0;
+    const rawCurrency = offer.price?.currency || SEARCH_CURRENCY;
 
     return {
-      id: String(offer.id || (offer && offer.slice ? offer.slice(0,8) : '')),
-      _id: String(offer.id || ''),
-      provider: 'amadeus',
-      airline: segment ? (normalizeAirlineCode(segment.carrierCode) || '') : (String((offer.validatingAirlineCodes || [])[0] || '')).toUpperCase(),
-      flightNumber: segment ? (segment.number || '') : '',
-      origin: segment ? (segment.departure?.iataCode || '') : '',
-      destination: segment ? (segment.arrival?.iataCode || '') : '',
-      departureAt: segment ? (segment.departure?.at || '') : '',
-      arrivalAt: segment ? (segment.arrival?.at || '') : '',
-      seatsAvailable: seatsAvailable,
-      price: {
-        amount: Number(Math.round(priceAmount || 0)), // major units (rounded)
-        currency: currency || 'INR'
-      },
-      raw: offer
+      id:           String(offer.id || ''),
+      _id:          String(offer.id || ''),
+      provider:     'amadeus',
+      // Always return the REAL route the user searched for (not sandbox proxied codes)
+      airline:      (first.carrierCode || offer.validatingAirlineCodes?.[0] || '').toUpperCase(),
+      flightNumber: first.number || '',
+      origin:       realOrigin,
+      destination:  realDestination,
+      departureAt:  first.departure?.at || '',
+      arrivalAt:    last?.arrival?.at   || '',
+      seatsAvailable: typeof offer.numberOfBookableSeats === 'number' ? offer.numberOfBookableSeats : null,
+      price: { amount: toINR(rawAmount, rawCurrency), currency: 'INR' },
+      raw:   offer
     };
   } catch (e) {
-    console.error('[amadeus] map error', e && e.message);
     return null;
   }
 }
 
-
-/** Public search function — returns wrapper { ok, flights, diagnostic } */
 async function search({ origin, destination, date, limit = 20 } = {}) {
-  try {
-    if (!origin || !destination || !date) {
-      return { ok: false, flights: [], diagnostic: { message: 'missing origin/destination/date' } };
-    }
-
-    // Build params exactly as Amadeus expects
-    const params = {
-      originLocationCode: origin,
-      destinationLocationCode: destination,
-      departureDate: date,
-      adults: 1,
-      currencyCode: 'INR',
-      max: limit
-    };
-
-    // console.log('[amadeus] issuing search', { ...params, ts: new Date().toISOString() });
-
-    const call = await callAmadeusWithRetries('/v2/shopping/flight-offers', { params, timeout: 15000, attempts: 4 });
-
-    if (!call.ok) {
-      console.warn('[amadeus] search error (final):', call.diagnostic || call);
-      return { ok: false, flights: [], diagnostic: call.diagnostic || call };
-    }
-
-    const data = call.data;
-    if (!data || !Array.isArray(data.data)) {
-      // sometimes Amadeus returns wrapper objects or errors — include whole data for diagnostics
-      return { ok: false, flights: [], diagnostic: { message: 'unexpected response shape', data } };
-    }
-
-    const offers = data.data;
-    const mapped = offers.map(mapAmadeusOffer).filter(Boolean);
-    return { ok: true, flights: mapped, diagnostic: null };
-
-  } catch (err) {
-    console.error('[amadeus] unexpected search error', err && err.stack ? err.stack : err);
-    const diag = { message: err?.message || String(err) };
-    if (err?.response) { diag.status = err.response.status; diag.data = err.response.data; diag.headers = err.response.headers; }
-    return { ok: false, flights: [], diagnostic: diag };
+  if (!origin || !destination || !date) {
+    return { ok: false, flights: [], diagnostic: { message: 'missing origin/destination/date' } };
   }
+
+  const realOrigin = origin.toUpperCase();
+  const realDest   = destination.toUpperCase();
+  const sbOrigin   = sandboxCode(realOrigin);
+  const sbDest     = sandboxCode(realDest);
+
+  const mapped = !IS_PRODUCTION && (sbOrigin !== realOrigin || sbDest !== realDest);
+  if (mapped) {
+    console.log(`[amadeus] sandbox: mapping ${realOrigin}→${realDest} to ${sbOrigin}→${sbDest}`);
+  } else {
+    console.log(`[amadeus] search ${realOrigin}→${realDest} on ${date} (${IS_PRODUCTION ? 'production' : 'sandbox'})`);
+  }
+
+  const params = {
+    originLocationCode:      sbOrigin,
+    destinationLocationCode: sbDest,
+    departureDate:           date,
+    adults:                  1,
+    currencyCode:            SEARCH_CURRENCY,
+    max:                     Math.min(Number(limit) || 20, 50)
+  };
+
+  const result = await searchWithRetry(params, 2);
+
+  if (!result.ok) {
+    console.warn(`[amadeus] search failed: ${result.msg}`);
+    return {
+      ok: false, flights: [],
+      diagnostic: { message: result.msg, status: result.status, amadeusCode: result.amadeusCode }
+    };
+  }
+
+  if (!Array.isArray(result.data?.data)) {
+    return { ok: false, flights: [], diagnostic: { message: 'unexpected response shape' } };
+  }
+
+  const flights = result.data.data
+    .map(o => mapOffer(o, realOrigin, realDest))
+    .filter(Boolean);
+
+  console.log(`[amadeus] ✅ ${flights.length} flights (${realOrigin}→${realDest})`);
+  return { ok: true, flights, diagnostic: null };
 }
 
-/** getFlight: in sandbox we cannot fetch by id; return diagnostic */
-async function getFlight(id) {
-  return {
-    ok: false,
-    flight: null,
-    diagnostic: { message: 'Amadeus sandbox: getFlight by id not supported. Use search and pass full offer.' }
-  };
+async function getFlight() {
+  return { ok: false, flight: null, diagnostic: { message: 'getFlight not supported in Amadeus sandbox' } };
 }
 
 async function revalidate({ offer }) {
   try {
-    if (!offer) {
-      return { ok: false, reason: 'missing_offer' };
-    }
-
-    const params = {
-      data: {
-        type: 'flight-offers-pricing',
-        flightOffers: [offer]
-      }
-    };
-
+    if (!offer) return { ok: false, reason: 'missing_offer' };
     const token = await getToken();
-    if (!token) {
-      return { ok: false, reason: 'auth_failed' };
-    }
-
+    if (!token) return { ok: false, reason: 'auth_failed' };
     const resp = await axios.post(
       `${BASE_API}/v1/shopping/flight-offers/pricing`,
-      params,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        },
-        timeout: 15000
-      }
+      { data: { type: 'flight-offers-pricing', flightOffers: [offer] } },
+      { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 15000 }
     );
-
-    const pricedOffer = resp?.data?.data?.flightOffers?.[0];
-    if (!pricedOffer) {
-      return { ok: false, reason: 'no_priced_offer' };
-    }
-
-    return {
-      ok: true,
-      price: {
-        amount: Number(pricedOffer.price.total),
-        currency: pricedOffer.price.currency
-      },
-      raw: pricedOffer
-    };
+    const priced = resp?.data?.data?.flightOffers?.[0];
+    if (!priced) return { ok: false, reason: 'no_priced_offer' };
+    const amt = Number(priced.price?.total || 0);
+    const cur = priced.price?.currency || SEARCH_CURRENCY;
+    return { ok: true, price: { amount: toINR(amt, cur), currency: 'INR' }, raw: priced };
   } catch (err) {
-    console.error('[amadeus] revalidate error', err?.response?.data || err.message);
-    return {
-      ok: false,
-      reason: 'provider_error',
-      diagnostic: err?.response?.data || err.message
-    };
+    return { ok: false, reason: 'provider_error', diagnostic: err?.response?.data || err?.message };
   }
 }
 
 async function issueTicket({ booking }) {
   try {
-    if (!booking || !booking.providerMeta) {
-      return { ok: false, reason: 'missing_booking_meta' };
-    }
-
+    if (!booking?.providerMeta) return { ok: false, reason: 'missing_booking_meta' };
     const token = await getToken();
-    if (!token) {
-      return { ok: false, reason: 'auth_failed' };
-    }
-
-    // Existing Amadeus order creation logic (reuse what you already have)
+    if (!token) return { ok: false, reason: 'auth_failed' };
     const resp = await axios.post(
       `${BASE_API}/v1/booking/flight-orders`,
       booking.providerMeta.orderPayload,
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        }
-      }
+      { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 20000 }
     );
-
-    const pnr =
-      resp?.data?.data?.associatedRecords?.[0]?.reference ||
-      null;
-
-    if (!pnr) {
-      return { ok: false, reason: 'pnr_not_returned', raw: resp?.data };
-    }
-
-    return {
-      ok: true,
-      pnr,
-      raw: resp.data
-    };
+    const pnr = resp?.data?.data?.associatedRecords?.[0]?.reference || null;
+    if (!pnr) return { ok: false, reason: 'pnr_not_returned', raw: resp?.data };
+    return { ok: true, pnr, raw: resp.data };
   } catch (err) {
-    console.error('[amadeus] issueTicket error', err?.response?.data || err.message);
-    return {
-      ok: false,
-      reason: 'provider_error',
-      diagnostic: err?.response?.data || err.message
-    };
+    return { ok: false, reason: 'provider_error', diagnostic: err?.response?.data || err?.message };
   }
 }
 
-
-module.exports = {
-  providerId: 'amadeus',
-  search,
-  getFlight,
-  revalidate,
-  issueTicket,
-};
+module.exports = { providerId: 'amadeus', search, getFlight, revalidate, issueTicket, _getToken: getToken };

@@ -58,8 +58,9 @@ async function reconcileOnce({
   const entries = [];
 
   const bookings = await Booking.find({
-    paymentStatus: 'PENDING',
-    bookingStatus: 'PENDING'
+    paymentStatus: { $in: ['PENDING'] },
+    bookingStatus: { $in: ['PENDING', 'HELD'] },
+    reconcilerExcluded: { $ne: true },   // skip admin-excluded bookings
   })
     .sort({ createdAt: 1 })
     .limit(limit);
@@ -68,6 +69,30 @@ async function reconcileOnce({
     result.checked++;
 
     try {
+      /* 🔒 DATA QUALITY: skip bookings that can never succeed */
+      const missingEmail  = !booking.contact?.email;
+      const invalidAmount = !Number(booking.price?.amount) || Number(booking.price?.amount) <= 0;
+      const missingStripe = !booking.stripeSessionParams?.params && !booking.lastPaymentLinkUrl;
+
+      if (missingEmail || invalidAmount || missingStripe) {
+        const reasons = [
+          missingEmail  && 'no contact email',
+          invalidAmount && 'invalid price amount',
+          missingStripe && 'no stripe session params or payment link',
+        ].filter(Boolean).join(', ');
+
+        console.warn(`[paymentRetry] Excluding booking ${booking.bookingRef} (${booking._id}): ${reasons}`);
+
+        // Auto-exclude so it never gets processed again
+        booking.reconcilerExcluded = true;
+        booking.reconcilerNote     = `Auto-excluded: ${reasons}`;
+        await booking.save();
+
+        entries.push({ bookingId: booking._id, result: 'SKIPPED', message: `Auto-excluded: ${reasons}` });
+        result.skipped++;
+        continue;
+      }
+
       /* ❌ HARD EXPIRY */
       if (isExpired(booking)) {
         entries.push({

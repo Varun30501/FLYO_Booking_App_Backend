@@ -10,7 +10,15 @@ const SeatSchema = new Schema({
   priceModifier: { type: Number, default: 0 },
   status: { type: String, enum: ['free', 'held', 'booked'], default: 'free' },
   heldBy: { type: String, default: null }, // store userId or session id
-  holdUntil: Date
+  holdUntil: Date,
+  heldUntil: Date, // alias used by frontend countdown timer
+  features: {
+    extraLegroom: { type: Boolean, default: false },
+    exitRow:      { type: Boolean, default: false },
+    window:       { type: Boolean, default: false },
+    aisle:        { type: Boolean, default: false },
+    bulkhead:     { type: Boolean, default: false },
+  }
 }, { _id: false });
 
 const SeatMapSchema = new Schema({

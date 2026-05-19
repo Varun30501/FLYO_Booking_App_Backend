@@ -151,234 +151,237 @@ async function sendMail({ to, subject = '', html = '', text = '', bcc, attachmen
 
 
 /**
- * Compose email body with price breakdown using seatsMeta and booking.price
- * Supports addons, discounts, coupons arrays and single discount fields.
+ * composeBookingEmail — FLYO branded HTML email
  */
 function composeBookingEmail(b) {
-  const bookingRef = b.bookingRef || '—';
-  const flightId = b.flightId || '—';
-  const passengerCount = Array.isArray(b.passengers) ? b.passengers.length : (b.passengerCount || 0);
-  const booking = b; // alias for clarity
-
-  // Build passengers with seats: try to pair passenger index -> seat label
+  const bookingRef     = b.bookingRef || '—';
+  const flightId       = b.flightId   || '—';
+  const currency       = (b.price && b.price.currency) || 'INR';
   const passengerLines = (Array.isArray(b.passengers) ? b.passengers : []).map((p, idx) => {
-    const nameParts = [p.title, p.firstName, p.lastName].filter(Boolean).join(' ').trim() || (p.name || `Passenger ${idx + 1}`);
-    let seat = '-';
+    const name = [p.title, p.firstName, p.lastName].filter(Boolean).join(' ').trim() || p.name || `Passenger ${idx + 1}`;
+    let seat = '—';
     try {
       if (Array.isArray(b.seats) && b.seats[idx]) {
         const s = b.seats[idx];
-        seat = (typeof s === 'string' || typeof s === 'number') ? String(s) : (s.label || s.seatId || s.seat || JSON.stringify(s));
+        seat = typeof s === 'string' ? s : (s.label || s.seatId || s.seat || '—');
       } else if (p.seat) seat = p.seat;
-    } catch (e) { seat = '-'; }
-    return { name: nameParts, seat: String(seat || '-') };
+    } catch { seat = '—'; }
+    return { name, seat: String(seat) };
   });
 
-  // fallback seat list
-  let seatList = '-';
-  if (passengerLines.length) seatList = passengerLines.map(x => `${x.seat}`).join(', ');
-  else if (Array.isArray(b.seats) && b.seats.length) seatList = b.seats.map(s => (s && (s.label || s.seatId)) ? (s.label || s.seatId) : s).join(', ');
-  else if (Array.isArray(b.seatsMeta) && b.seatsMeta.length) seatList = b.seatsMeta.map(s => s.seatId || s.seat || '').join(', ');
+  const seatList = passengerLines.length
+    ? passengerLines.map(x => x.seat).join(', ')
+    : (Array.isArray(b.seats) ? b.seats.map(s => (s && (s.label || s.seatId)) || s).join(', ') : '—');
 
-  // pricing: compute using seatsMeta (preferred)
-  const currency = (b.price && b.price.currency) || 'INR';
-
-  const seatsMeta = Array.isArray(b.seatsMeta) ? b.seatsMeta : [];
-
-  // seatsSubtotal = sum(seat.price)
-  const seatsSubtotal = seatsMeta.reduce((acc, s) => acc + (Number(s.price || 0)), 0);
-
-  // classExtras = sum(seat.priceModifier)
-  const classExtras = seatsMeta.reduce((acc, s) => acc + (Number(s.priceModifier || 0)), 0);
-
-  // baseSubtotal = seatsSubtotal - classExtras
-  const baseSubtotal = seatsSubtotal - classExtras;
-
-  // ADDONS support: b.addons array or b.addonsTotal
-  let addonsTotal = 0;
-  let addonsList = [];
+  // Pricing
+  const seatsMeta      = Array.isArray(b.seatsMeta) ? b.seatsMeta : [];
+  const seatsSubtotal  = seatsMeta.reduce((a, s) => a + Number(s.price || 0), 0);
+  const classExtras    = seatsMeta.reduce((a, s) => a + Number(s.priceModifier || 0), 0);
+  const baseSubtotal   = seatsSubtotal - classExtras;
+  let   addonsTotal    = 0;
+  const addonsList     = [];
   if (Array.isArray(b.addons) && b.addons.length) {
     b.addons.forEach(a => {
-      const name = a.name || a.key || a.label || 'addon';
-      const amt = Number(a.amount ?? a.price ?? a.value ?? 0) || 0;
-      const qty = Number(a.qty ?? a.Qty ?? a.quantity ?? 1) || 1;
+      const amt  = Number(a.amount ?? a.price ?? 0) || 0;
+      const qty  = Number(a.qty ?? 1) || 1;
       const line = Math.round(amt * qty);
       addonsTotal += line;
-      addonsList.push({ name, amount: line, qty });
+      addonsList.push({ name: a.name || 'Add-on', amount: line, qty });
     });
-  } else if (b.price && Number.isFinite(Number(b.price.addonsTotal))) {
-    addonsTotal = Math.round(Number(b.price.addonsTotal));
-  } else if (b.addonsTotal && Number.isFinite(Number(b.addonsTotal))) {
-    addonsTotal = Math.round(Number(b.addonsTotal));
-  }
+  } else addonsTotal = Number(b.price?.addonsTotal || 0);
 
-  // DISCOUNTS / COUPONS support
   let discountsTotal = 0;
-  const couponsApplied = [];
+  const couponLines  = [];
+  (Array.isArray(b.discounts) ? b.discounts : []).forEach(d => {
+    const amt = Math.abs(Number(d.amount || 0));
+    discountsTotal += amt;
+    couponLines.push({ label: d.name || 'Discount', amount: amt });
+  });
+  (Array.isArray(b.coupons) ? b.coupons : []).forEach(c => {
+    const amt = Math.abs(Number(c.amount || c.discount || 0));
+    discountsTotal += amt;
+    couponLines.push({ label: `Coupon ${c.code || ''}`, amount: amt });
+  });
 
-  if (Array.isArray(b.discounts) && b.discounts.length) {
-    b.discounts.forEach(d => {
-      const name = d.name || d.reason || "discount";
-      const amt = Math.abs(Number(d.amount || 0));
-      discountsTotal += amt;
-      couponsApplied.push({ type: "discount", name, code: null, amount: Math.round(amt), percent: 0, reason: d.reason || "", metadata: d.metadata || {} });
-    });
-  }
+  const taxMajor    = Number(b.price?.tax || b.price?.taxes || 0);
+  const totalMajor  = Number(b.price?.amount) || Math.round(baseSubtotal + classExtras + addonsTotal - discountsTotal + taxMajor);
 
-  if (Array.isArray(b.coupons) && b.coupons.length) {
-    b.coupons.forEach(c => {
-      const code = c.code || c.coupon || "COUPON";
-      const amt = Math.abs(Number(c.amount || c.discount || 0));
-      const pct = Number(c.percent || 0);
-      const reason = c.reason || c.metadata?.note || '';
-      const meta = c.metadata || {};
-      discountsTotal += amt;
-      couponsApplied.push({ type: "coupon", name: code, code, percent: pct, amount: Math.round(amt), reason, metadata: meta, cap: c.cap || 0, validated: c.validated || false });
-    });
-  }
+  const fmt = n => formatMoneyMajor(n, currency);
 
-  // single fallback discount fields
-  if (!discountsTotal && b.price && (Number.isFinite(Number(b.price.discount)) || Number.isFinite(Number(b.discount)))) {
-    const single = Number(b.price.discount ?? b.discount ?? 0) || 0;
-    discountsTotal += Math.abs(single);
-    if (single) couponsApplied.push({ type: "discount", name: "discount", code: null, amount: Math.round(Math.abs(single)), percent: 0, reason: "", metadata: {} });
-  }
+  // ── Route info from raw itinerary
+  const segs  = b.raw?.itineraries?.[0]?.segments || [];
+  const first = segs[0];
+  const last  = segs[segs.length - 1];
+  const depTime = first?.departure?.at ? new Date(first.departure.at).toLocaleString('en-IN', { dateStyle:'medium', timeStyle:'short' }) : safeDate(b.travelDate);
+  const arrTime = last?.arrival?.at   ? new Date(last.arrival.at).toLocaleString('en-IN',   { dateStyle:'medium', timeStyle:'short' }) : '—';
+  const origin  = b.origin      || first?.departure?.iataCode || '—';
+  const dest    = b.destination || last?.arrival?.iataCode    || '—';
+  const airline = b.airline     || first?.carrierCode         || '—';
+  const flightNo = b.flightNumber || first?.number            || '';
 
-  // Tax: prefer booking.price.tax or booking.price.taxes else fallback to b.price.tax (0)
-  let taxMajor = 0;
-  if (b.price && typeof b.price.tax === 'number') taxMajor = Number(b.price.tax);
-  else if (b.price && typeof b.price.taxes === 'number') taxMajor = Number(b.price.taxes);
-  else if (typeof b.price === 'object' && (b.price.tax || b.price.taxes)) taxMajor = Number(b.price.tax || b.price.taxes || 0);
+  // ── plain text fallback
+  const text = [
+    `FLYO — Booking Confirmed`,
+    `Ref: ${bookingRef}`,
+    ``,
+    `${origin} → ${dest} | ${airline} ${flightNo}`,
+    `Departure: ${depTime} | Arrival: ${arrTime}`,
+    ``,
+    `Passengers:`,
+    ...passengerLines.map(p => `  ${p.name} — Seat ${p.seat}`),
+    ``,
+    `Base fare:    ${fmt(baseSubtotal)}`,
+    classExtras   ? `Class extras: ${fmt(classExtras)}`   : null,
+    addonsTotal   ? `Add-ons:      ${fmt(addonsTotal)}`   : null,
+    discountsTotal? `Discounts:   -${fmt(discountsTotal)}`  : null,
+    taxMajor      ? `Taxes & fees: ${fmt(taxMajor)}`      : null,
+    `Total paid:   ${fmt(totalMajor)}`,
+    ``,
+    `Your itinerary PDF is attached.`,
+    `Thank you for flying with FLYO.`,
+  ].filter(l => l !== null).join('\n');
 
-  // If tax not present but booking.price.amount present, derive tax as difference if seatsSubtotal+addons-discounts exists
-  let totalMajor = Number.isFinite(Number(b.price && b.price.amount)) ? Number(b.price.amount) : null;
-  if ((taxMajor === 0 || !Number.isFinite(taxMajor)) && totalMajor !== null && (seatsSubtotal + addonsTotal - discountsTotal) > 0) {
-    const calcTax = totalMajor - (seatsSubtotal + addonsTotal - discountsTotal);
-    if (Number.isFinite(calcTax) && calcTax >= 0) taxMajor = Math.round(calcTax);
-  }
+  // ── HTML
+  const BRAND   = '#00d4ff';
+  const DARK_BG = '#04071a';
+  const CARD_BG = '#07102a';
+  const BORDER  = '#1e2d4d';
+  const MUTED   = '#8b9dbf';
+  const WHITE   = '#f0f4ff';
 
-  // final totals fallback
-  const subtotal = Math.round(baseSubtotal || 0);
-  const classPrice = Math.round(classExtras || 0);
-  const addons = Math.round(addonsTotal || 0);
-  const discounts = Math.round(discountsTotal || 0);
-  const tax = Math.round(taxMajor || 0);
-  const total = (totalMajor !== null && Number.isFinite(totalMajor)) ? Math.round(totalMajor) : Math.round(subtotal + classPrice + addons - discounts + tax);
+  const row = (label, value, bold = false, color = WHITE) =>
+    `<tr>
+      <td style="padding:8px 12px;color:${MUTED};font-size:13px;">${label}</td>
+      <td style="padding:8px 12px;color:${color};font-size:13px;text-align:right;${bold ? 'font-weight:700;' : ''}">${value}</td>
+    </tr>`;
 
-  // build plain text
-  const lines = [];
-  lines.push(`Your booking ${bookingRef} is confirmed.`);
-  lines.push('');
-  lines.push(`Flight ID: ${flightId}`);
-  lines.push(`Passengers: ${passengerCount}`);
-  lines.push('');
-  lines.push('Passenger details:');
-  passengerLines.forEach(pl => lines.push(` - ${pl.name} — Seat: ${pl.seat}`));
-  lines.push('');
-  lines.push(`Seats: ${seatList}`);
-  lines.push('');
-  lines.push(`Base price: ${formatMoneyMajor(subtotal, currency)}`);
-  lines.push(`Class / seat extras: ${formatMoneyMajor(classPrice, currency)}`);
-  if (addons > 0) {
-    lines.push(`Add-ons: ${formatMoneyMajor(addons, currency)}`);
-    (addonsList || []).forEach(a => lines.push(`   • ${a.name} x${a.qty}: ${formatMoneyMajor(a.amount, currency)}`));
-  }
-  if (discounts > 0) {
-    lines.push(`Discounts / coupons: -${formatMoneyMajor(discounts, currency)}`);
-    (couponsApplied || []).forEach(c => {
-      if (c.type === 'coupon') {
-        lines.push(`   • Coupon ${c.code}: -${formatMoneyMajor(c.amount, currency)}${c.cap ? ` (cap ${formatMoneyMajor(c.cap, currency)})` : ''}${c.reason ? ` — ${c.reason}` : ''}`);
-        if (c.metadata && Object.keys(c.metadata).length) {
-          lines.push(`      metadata: ${JSON.stringify(c.metadata)}`);
-        }
-      } else {
-        lines.push(`   • ${c.name}: -${formatMoneyMajor(c.amount, currency)}`);
-      }
-    });
-  }
-  lines.push(`Taxes & fees: ${formatMoneyMajor(tax, currency)}`);
-  lines.push('');
-  lines.push(`Total Paid: ${formatMoneyMajor(total, currency)}`);
-  lines.push('');
-  lines.push('Thank you for booking with us!');
-  lines.push('----------------------------------------------');
-  lines.push(`BookingRef: ${bookingRef}`);
-  lines.push(`Passenger Count: ${passengerCount}`);
-  lines.push(`Seats: ${seatList}`);
-  lines.push(`Price object: ${JSON.stringify(b.price || {})}`);
-  lines.push('----------------------------------------------');
+  const divider = `<tr><td colspan="2" style="padding:0 12px;"><div style="height:1px;background:${BORDER};"></div></td></tr>`;
 
-  const text = lines.join('\n');
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Booking Confirmed — ${bookingRef}</title></head>
+<body style="margin:0;padding:0;background:${DARK_BG};font-family:'Helvetica Neue',Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:${DARK_BG};padding:32px 16px;">
+<tr><td align="center">
+<table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
 
-  // Compose HTML (readable)
-  const html = `
-    <div style="font-family: Arial, Helvetica, sans-serif; color: #111;">
-      <h2>Booking Confirmed — ${bookingRef}</h2>
-      <p>Your booking <strong>${bookingRef}</strong> is confirmed.</p>
-
-
-      <h3>Flight & Passenger details</h3>
-      <p><strong>Flight ID:</strong> ${flightId}<br/>
-         <strong>Passengers:</strong> ${passengerCount}</p>
-
-      <table style="width:100%; border-collapse:collapse; margin-bottom:12px;">
-        <thead>
-          <tr>
-            <th style="text-align:left; padding:6px; border-bottom:1px solid #eee;">Passenger</th>
-            <th style="text-align:left; padding:6px; border-bottom:1px solid #eee;">Seat</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${passengerLines.map(pl => `<tr><td style="padding:6px;">${pl.name}</td><td style="padding:6px;">${pl.seat}</td></tr>`).join('')}
-        </tbody>
-      </table>
-
-      <h3 style="margin-top:8px;">Price breakdown</h3>
-      <table style="width:100%; border-collapse:collapse;">
-        <tbody>
-          <tr><td style="padding:6px;">Base price</td><td style="padding:6px; text-align:right;">${formatMoneyMajor(subtotal, currency)}</td></tr>
-          <tr><td style="padding:6px;">Class / seat extras</td><td style="padding:6px; text-align:right;">${formatMoneyMajor(classPrice, currency)}</td></tr>
-          <tr><td style="padding:6px;">Seats subtotal (base + class)</td><td style="padding:6px; text-align:right;">${formatMoneyMajor(seatsSubtotal, currency)}</td></tr>
-          ${addons > 0 ? `<tr><td style="padding:6px;">Add-ons</td><td style="padding:6px; text-align:right;">${formatMoneyMajor(addons, currency)}</td></tr>
-            ${addonsList.map(a => `<tr><td style="padding:6px; padding-left:18px;">• ${a.name} x${a.qty}</td><td style="padding:6px; text-align:right;">${formatMoneyMajor(a.amount, currency)}</td></tr>`).join('')}` : ''}
-
-          ${discounts > 0 ? `
-            <tr><td style="padding:6px;">Discounts & Coupons</td>
-            <td style="padding:6px; text-align:right;">-${formatMoneyMajor(discounts, currency)}</td></tr>
-
-          ${couponsApplied.map(c => `
-            <tr>
-              <td style="padding:6px; padding-left:18px;">
-                ${c.type === "coupon" ? `Coupon <strong>${c.code}</strong>` : c.name}
-                ${c.percent ? ` (${c.percent}% off)` : ""}
-                ${c.cap ? ` (cap ${formatMoneyMajor(c.cap, currency)})` : ""}
-                ${c.reason ? `<div style="color:#777; font-size:12px;">${c.reason}</div>` : ""}
-                ${c.metadata && Object.keys(c.metadata).length
-      ? `<div style="font-size:11px;color:#888;margin-top:4px;">${Object.entries(c.metadata)
-        .map(([k, v]) => `${k}: ${v}`)
-        .join(", ")}</div>`
-      : ""}
-              </td>
-              <td style="padding:6px; text-align:right;">-${formatMoneyMajor(c.amount, currency)}</td>
-            </tr>
-          `).join('')}
-          ` : ''}
-
-          <tr><td style="padding:6px;">Taxes & fees</td><td style="padding:6px; text-align:right;">${formatMoneyMajor(tax, currency)}</td></tr>
-          <tr><td style="padding:6px; border-top:1px solid #eee;"><strong>Total Paid</strong></td><td style="padding:6px; text-align:right; border-top:1px solid #eee;"><strong>${formatMoneyMajor(total, currency)}</strong></td></tr>
-        </tbody>
-      </table>
-
-      <p style="margin-top:12px;">Seats: ${seatList}</p>
-
-      <hr/>
-      <p style="font-size:12px;color:#666;">BookingRef: ${bookingRef} • Passenger Count: ${passengerCount}</p>
+  <!-- Header -->
+  <tr><td style="background:${CARD_BG};border-radius:16px 16px 0 0;padding:0;overflow:hidden;">
+    <div style="height:3px;background:linear-gradient(90deg,#00d4ff,#2563eb,#7c3aed);border-radius:16px 16px 0 0;"></div>
+    <div style="padding:24px 32px;display:flex;align-items:center;gap:12px;">
+      <table cellpadding="0" cellspacing="0"><tr>
+        <td style="width:36px;height:36px;background:#00d4ff;border-radius:50%;text-align:center;vertical-align:middle;">
+          <span style="color:#04071a;font-weight:900;font-size:14px;font-family:Georgia,serif;">F</span>
+        </td>
+        <td style="padding-left:12px;vertical-align:middle;">
+          <span style="color:#ffffff;font-weight:900;font-size:20px;letter-spacing:-0.5px;">FLYO</span>
+        </td>
+        <td style="padding-left:24px;vertical-align:middle;">
+          <span style="background:rgba(16,185,129,0.15);border:1px solid rgba(16,185,129,0.35);color:#10b981;padding:4px 12px;border-radius:20px;font-size:11px;font-weight:700;letter-spacing:0.08em;">✓ CONFIRMED</span>
+        </td>
+      </tr></table>
     </div>
-  `;
+  </td></tr>
 
-  // debug info includes coupon breakdown for frontend if desired
-  const debug = { subtotal, classPrice, seatsSubtotal, addons, discounts, tax, total, coupons: couponsApplied };
+  <!-- Route hero -->
+  <tr><td style="background:linear-gradient(135deg,rgba(0,212,255,0.06),rgba(37,99,235,0.08));padding:28px 32px;border-top:1px solid ${BORDER};">
+    <table width="100%" cellpadding="0" cellspacing="0"><tr>
+      <td style="text-align:center;width:33%;">
+        <div style="font-size:36px;font-weight:900;color:${WHITE};letter-spacing:-1px;">${origin}</div>
+        <div style="font-size:12px;color:${MUTED};margin-top:4px;">${depTime}</div>
+      </td>
+      <td style="text-align:center;width:34%;vertical-align:middle;padding:0 8px;">
+        <div style="color:${MUTED};font-size:11px;margin-bottom:6px;">${airline} ${flightNo}</div>
+        <div style="position:relative;height:2px;background:linear-gradient(90deg,transparent,${BRAND},transparent);border-radius:2px;">
+          <span style="position:absolute;top:-9px;left:50%;transform:translateX(-50%);font-size:18px;">✈</span>
+        </div>
+        <div style="color:${MUTED};font-size:11px;margin-top:6px;">Non-stop</div>
+      </td>
+      <td style="text-align:center;width:33%;">
+        <div style="font-size:36px;font-weight:900;color:${WHITE};letter-spacing:-1px;">${dest}</div>
+        <div style="font-size:12px;color:${MUTED};margin-top:4px;">${arrTime}</div>
+      </td>
+    </tr></table>
 
-  return { subject: `Booking Confirmed — ${bookingRef}`, text, html, attachments: [], debug };
+    <!-- Booking ref chip -->
+    <div style="margin-top:20px;text-align:center;">
+      <span style="display:inline-block;background:rgba(0,212,255,0.08);border:1px solid rgba(0,212,255,0.22);color:${BRAND};padding:6px 20px;border-radius:20px;font-size:13px;font-weight:700;letter-spacing:0.08em;font-family:monospace;">
+        ${bookingRef}
+      </span>
+    </div>
+  </td></tr>
+
+  <!-- Passengers -->
+  <tr><td style="background:${CARD_BG};padding:24px 32px;border-top:1px solid ${BORDER};">
+    <div style="font-size:11px;font-weight:700;color:${MUTED};letter-spacing:0.12em;text-transform:uppercase;margin-bottom:14px;">Passengers & Seats</div>
+    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+      <thead>
+        <tr style="background:rgba(255,255,255,0.03);">
+          <th style="padding:8px 12px;text-align:left;color:${MUTED};font-size:11px;font-weight:600;border-bottom:1px solid ${BORDER};">Name</th>
+          <th style="padding:8px 12px;text-align:right;color:${MUTED};font-size:11px;font-weight:600;border-bottom:1px solid ${BORDER};">Type</th>
+          <th style="padding:8px 12px;text-align:right;color:${MUTED};font-size:11px;font-weight:600;border-bottom:1px solid ${BORDER};">Seat</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${passengerLines.map((p, i) => `
+        <tr style="border-bottom:1px solid rgba(255,255,255,0.04);">
+          <td style="padding:10px 12px;color:${WHITE};font-size:13px;">${p.name}</td>
+          <td style="padding:10px 12px;color:${MUTED};font-size:12px;text-align:right;">${(b.passengers?.[i]?.type || b.passengers?.[i]?.passengerType || 'Adult').toLowerCase()}</td>
+          <td style="padding:10px 12px;text-align:right;">
+            <span style="background:rgba(0,212,255,0.1);border:1px solid rgba(0,212,255,0.2);color:${BRAND};padding:2px 10px;border-radius:6px;font-size:12px;font-weight:700;font-family:monospace;">${p.seat}</span>
+          </td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+  </td></tr>
+
+  <!-- Price breakdown -->
+  <tr><td style="background:${CARD_BG};padding:24px 32px;border-top:1px solid ${BORDER};">
+    <div style="font-size:11px;font-weight:700;color:${MUTED};letter-spacing:0.12em;text-transform:uppercase;margin-bottom:14px;">Fare Breakdown</div>
+    <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+      <tbody>
+        ${row('Base fare', fmt(baseSubtotal))}
+        ${classExtras > 0 ? row('Class / seat extras', fmt(classExtras)) : ''}
+        ${addonsList.map(a => row(`Add-on: ${a.name} ×${a.qty}`, fmt(a.amount))).join('')}
+        ${couponLines.map(c => row(c.label, `-${fmt(c.amount)}`, false, '#10b981')).join('')}
+        ${taxMajor > 0 ? row('Taxes & fees', fmt(taxMajor)) : ''}
+        ${divider}
+        ${row('<strong>Total paid</strong>', `<strong>${fmt(totalMajor)}</strong>`, true, BRAND)}
+      </tbody>
+    </table>
+  </td></tr>
+
+  <!-- What next -->
+  <tr><td style="background:rgba(0,212,255,0.04);padding:20px 32px;border-top:1px solid ${BORDER};border-radius:0 0 16px 16px;">
+    <div style="font-size:11px;font-weight:700;color:${MUTED};letter-spacing:0.12em;text-transform:uppercase;margin-bottom:12px;">What's next?</div>
+    <table cellpadding="0" cellspacing="0"><tbody>
+      ${[
+        ['📄', 'Your itinerary PDF is attached to this email'],
+        ['🗓', 'Check in opens 48 hours before departure'],
+        ['📞', 'Need help? Email support@flyo.com'],
+      ].map(([icon, text]) => `
+      <tr><td style="padding:4px 0;">
+        <span style="font-size:15px;">${icon}</span>
+        <span style="color:${MUTED};font-size:13px;padding-left:10px;">${text}</span>
+      </td></tr>`).join('')}
+    </tbody></table>
+  </td></tr>
+
+  <!-- Footer -->
+  <tr><td style="padding:24px 0;text-align:center;">
+    <div style="color:rgba(139,157,191,0.5);font-size:11px;">
+      © ${new Date().getFullYear()} FLYO · flyo.in · support@flyo.com<br>
+      <span style="color:rgba(139,157,191,0.3);">You're receiving this because you booked a flight with FLYO.</span>
+    </div>
+  </td></tr>
+
+</table>
+</td></tr></table>
+</body>
+</html>`;
+
+  return { subject: `Your FLYO booking is confirmed — ${bookingRef}`, text, html, attachments: [], debug: { totalMajor, taxMajor, addonsTotal, discountsTotal } };
 }
 
 /**
@@ -468,43 +471,66 @@ async function sendBookingConfirmation(booking, options = {}) {
   }
 }
 
-async function sendPaymentLink({
-  to,
-  bookingRef,
-  paymentUrl,
-  amount,
-  currency = 'INR'
-}) {
-  const subject = `Complete your payment – Booking ${bookingRef}`;
+async function sendPaymentLink({ to, bookingRef, paymentUrl, amount, currency = 'INR' }) {
+  const subject = `Complete your payment — FLYO Booking ${bookingRef}`;
+  const fmt = n => formatMoneyMajor(n, currency);
 
-  const html = `
-    <h2>Payment Pending</h2>
-    <p>Your booking <strong>${bookingRef}</strong> is awaiting payment.</p>
-    <p><strong>Amount:</strong> ${currency} ${amount}</p>
+  const html = `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Payment Pending — ${bookingRef}</title></head>
+<body style="margin:0;padding:0;background:#04071a;font-family:'Helvetica Neue',Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#04071a;padding:32px 16px;">
+<tr><td align="center">
+<table width="560" cellpadding="0" cellspacing="0" style="max-width:560px;width:100%;">
+  <tr><td style="background:#07102a;border-radius:16px;overflow:hidden;border:1px solid #1e2d4d;">
+    <div style="height:3px;background:linear-gradient(90deg,#00d4ff,#2563eb,#7c3aed);"></div>
+    <div style="padding:32px;">
+      <!-- Logo -->
+      <table cellpadding="0" cellspacing="0" style="margin-bottom:28px;"><tr>
+        <td style="width:32px;height:32px;background:#00d4ff;border-radius:50%;text-align:center;vertical-align:middle;">
+          <span style="color:#04071a;font-weight:900;font-size:13px;">F</span>
+        </td>
+        <td style="padding-left:10px;vertical-align:middle;">
+          <span style="color:#fff;font-weight:900;font-size:18px;">FLYO</span>
+        </td>
+      </tr></table>
 
-    <p>
-      <a href="${paymentUrl}"
-         style="
-           display:inline-block;
-           padding:12px 18px;
-           background:#2563eb;
-           color:#fff;
-           text-decoration:none;
-           border-radius:6px;
-           font-weight:600;
-         ">
-        Complete Payment
+      <!-- Status badge -->
+      <div style="margin-bottom:20px;">
+        <span style="background:rgba(245,158,11,0.12);border:1px solid rgba(245,158,11,0.3);color:#f59e0b;padding:4px 12px;border-radius:20px;font-size:11px;font-weight:700;letter-spacing:0.08em;">⏳ PAYMENT PENDING</span>
+      </div>
+
+      <h2 style="color:#f0f4ff;margin:0 0 8px;font-size:22px;font-weight:900;">Complete your booking</h2>
+      <p style="color:#8b9dbf;font-size:14px;margin:0 0 20px;line-height:1.6;">
+        Your booking <strong style="color:#f0f4ff;font-family:monospace;">${bookingRef}</strong> is reserved but awaiting payment. 
+        Complete your payment to confirm your seat.
+      </p>
+
+      <!-- Amount chip -->
+      <div style="background:rgba(0,212,255,0.07);border:1px solid rgba(0,212,255,0.18);border-radius:12px;padding:16px 20px;margin-bottom:24px;">
+        <div style="color:#8b9dbf;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:4px;">Amount due</div>
+        <div style="color:#00d4ff;font-size:28px;font-weight:900;">${fmt(amount)}</div>
+      </div>
+
+      <!-- CTA button -->
+      <a href="${paymentUrl}" style="display:block;text-align:center;background:linear-gradient(135deg,#00d4ff,#2563eb);color:#ffffff;text-decoration:none;padding:14px 28px;border-radius:12px;font-weight:700;font-size:15px;margin-bottom:20px;">
+        Complete Payment →
       </a>
-    </p>
 
-    <p>If you have already completed payment, you may ignore this email.</p>
-  `;
+      <p style="color:rgba(139,157,191,0.5);font-size:12px;text-align:center;margin:0;">
+        This link expires in 24 hours. If you have already paid, please ignore this email.
+      </p>
+    </div>
+    <div style="background:rgba(255,255,255,0.02);border-top:1px solid #1e2d4d;padding:16px 32px;text-align:center;">
+      <span style="color:rgba(139,157,191,0.4);font-size:11px;">© ${new Date().getFullYear()} FLYO · support@flyo.com</span>
+    </div>
+  </td></tr>
+</table>
+</td></tr></table>
+</body></html>`;
 
-  return sendMail({
-    to,
-    subject,
-    html
-  });
+  const text = `FLYO — Complete your booking ${bookingRef}\n\nAmount due: ${fmt(amount)}\n\nPay here: ${paymentUrl}\n\nThis link expires in 24 hours.`;
+
+  return sendMail({ to, subject, html, text });
 }
 
 module.exports = { sendMail, sendBookingConfirmation, composeBookingEmail, sendPaymentLink };

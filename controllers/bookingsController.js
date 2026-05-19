@@ -565,33 +565,26 @@ exports.create = async (req, res) => {
     });
 
     // Try to get seat map if present (for validation)
-    // ✅ SeatMap v2: use canonical resolver (same as seats routes)
-    // Find seatMap (date-aware but tolerant)
+    // ✅ SeatMap v2: must match flightId + travelDate + origin + destination exactly,
+    // mirroring seats.js GET so we always reference the same document that holds the
+    // live held/booked seat state. Without origin+destination this lookup can land on
+    // a template or a different-route clone, storing the wrong _id as booking.seatMapId
+    // and causing the webhook to mark seats on the wrong SeatMap document.
     let map = null;
 
-    // 1️⃣ Try date-specific seatMap
-    if (travelDate) {
-      map = await SeatMap.findOne({
-        $or: [
-          { flightId },
-          { legacyFlightId: flightId },
-          { aliases: flightId },
-          { airlineCode: flightId }
-        ],
-        travelDate
-      }).exec();
+    // 1️⃣ Exact match: flightId + date + route (same query as seats.js GET tier-1)
+    if (travelDate && origin && destination) {
+      map = await SeatMap.findOne({ flightId: String(flightId), travelDate, origin, destination }).exec();
     }
 
-    // 2️⃣ Fallback: non-date seatMap
+    // 2️⃣ Date+flightId only (origin/destination missing edge-case)
+    if (!map && travelDate) {
+      map = await SeatMap.findOne({ flightId: String(flightId), travelDate }).exec();
+    }
+
+    // 3️⃣ Any doc for this flightId (last resort - template fallback)
     if (!map) {
-      map = await SeatMap.findOne({
-        $or: [
-          { flightId },
-          { legacyFlightId: flightId },
-          { aliases: flightId },
-          { airlineCode: flightId }
-        ]
-      }).exec();
+      map = await SeatMap.findOne({ flightId: String(flightId) }).sort({ updatedAt: -1 }).exec();
     }
 
     if (!map) {
@@ -603,23 +596,50 @@ exports.create = async (req, res) => {
       travelDate = map.travelDate;
     }
 
-    // If seatmap present — validate requested seats exist & not booked/held (best effort)
-    // OPTIONAL: validate seat IDs exist in SeatMap (no mutation)
+    // Validate requested seats: must exist, must not be booked, must not be held by someone else
     if (map) {
+      const now = new Date();
+      const requestingUser = String(
+        req.userId ||
+        (req.user && (req.user._id || req.user.id)) ||
+        req.body.userId ||
+        req.body.heldBy ||
+        ''
+      );
+
       for (const seatObj of normalizedSeats) {
         const seatId = seatObj.seatId;
-        const exists = map.seats.some(
-          s => String(s.seatId) === String(seatId)
-        );
-        if (!exists) {
+        const seat = map.seats.find(s => String(s.seatId) === String(seatId));
+
+        if (!seat) {
           return res.status(400).json({
             success: false,
-            message: `invalid seat ${seatId}`
+            message: `Seat ${seatId} does not exist on this flight`
+          });
+        }
+
+        if (seat.status === 'booked') {
+          return res.status(409).json({
+            success: false,
+            message: `Seat ${seatId} is already booked`
+          });
+        }
+
+        // Treat an unexpired hold by another user as unavailable
+        if (
+          seat.status === 'held' &&
+          seat.heldBy &&
+          seat.heldBy !== requestingUser &&
+          seat.holdUntil &&
+          new Date(seat.holdUntil) > now
+        ) {
+          return res.status(409).json({
+            success: false,
+            message: `Seat ${seatId} is currently held by another user`
           });
         }
       }
-    }
-    else {
+    } else {
       console.warn('[bookings] SeatMap model not found — proceeding without seat confirmation (unsafe)');
     }
 

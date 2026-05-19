@@ -5,23 +5,39 @@ const PassengerSchema = new mongoose.Schema({
   title: { type: String, default: '' },
   firstName: { type: String, default: '' },
   lastName: { type: String, default: '' },
+  name: { type: String, default: '' }, // legacy fallback
   passport: { type: String, default: '' },
   dob: { type: Date },
-  passengerType: { type: String, default: 'adult' },
+  passengerType: { type: String, default: 'adult', enum: ['adult', 'child', 'infant'] },
+  gender: { type: String, default: '' }, // M | F | O
   nationality: { type: String, default: '' },
   documentType: { type: String, default: '' },
   documentNumber: { type: String, default: '' },
-  seat: { type: String, default: '' }
+  seat: { type: String, default: '' },
+  // Special assistance flags (wheelchair, mobility aid, etc.)
+  specialAssistance: {
+    disabled: { type: Boolean, default: false },
+    wheelchair: { type: Boolean, default: false },
+    notes: { type: String, default: '' }
+  }
 }, { _id: false });
 
 const PriceSchema = new mongoose.Schema({
   amount: { type: Number, default: 0 }, // major units (e.g. rupees)
   currency: { type: String, default: 'INR' },
+  perSeat: { type: Number, default: 0 },
   tax: { type: Number, default: 0 },
   taxes: { type: Number, default: 0 },
   discount: { type: Number, default: 0 },
   addonsTotal: { type: Number, default: 0 },
-  discountsTotal: { type: Number, default: 0 }
+  discountsTotal: { type: Number, default: 0 },
+  // Itemised breakdown from frontend (informational, non-authoritative)
+  breakdown: {
+    seats: { type: Number, default: 0 },
+    addons: { type: Number, default: 0 },
+    discount: { type: Number, default: 0 },
+    tax: { type: Number, default: 0 }
+  }
 }, { _id: false });
 
 /**
@@ -149,7 +165,11 @@ const BookingSchema = new mongoose.Schema({
 
   reconciliationAttempts: { type: Number, default: 0 },
   lastReconciledAt: { type: Date, default: null },
-  lastPaymentLinkUrl: { type: String, default: null }
+  lastPaymentLinkUrl: { type: String, default: null },
+
+  // Allows admin to permanently exclude a booking from the reconciler
+  reconcilerExcluded: { type: Boolean, default: false, index: true },
+  reconcilerNote: { type: String, default: '' },
 }, { timestamps: true });
 
 // helper: return seat labels in a safe way

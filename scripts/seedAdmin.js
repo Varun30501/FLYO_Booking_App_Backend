@@ -12,7 +12,7 @@ async function run() {
   await mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true });
   const pw = 'Admin123';
   const hash = await bcrypt.hash(pw, 10);
-  const email = 'admin@example.com';
+  const email = 'admin@flyo.com';
   // remove existing admin with same email so seed is deterministic
   await User.deleteMany({ email: { $regex: `^${email.replace(/\./g,'\\.')}$`, $options: 'i' } });
   const created = await User.create({

@@ -704,56 +704,83 @@ exports.webhook = async (req, res) => {
         if (Array.isArray(booking.seats) && booking.seats.length > 0) {
           const SeatMap = require('../models/SeatMap');
 
-          const map = await SeatMap.findOne({
-            flightId: booking.flightId,
-            travelDate: booking.travelDate,
-            origin: booking.origin,
-            destination: booking.destination
-          });
+          // Resolve the seat map — prefer the stored seatMapId reference (set at booking
+          // creation time) so we always hit the exact document regardless of flightId
+          // format differences. Fall back through progressively looser queries.
+          let map = null;
 
-          if (!map) {
-            console.error('[payments] seatMap not found for booking', {
-              bookingId: booking._id,
+          if (booking.seatMapId) {
+            map = await SeatMap.findById(booking.seatMapId);
+          }
+
+          if (!map && booking.flightId && booking.travelDate) {
+            map = await SeatMap.findOne({
               flightId: booking.flightId,
               travelDate: booking.travelDate,
               origin: booking.origin,
               destination: booking.destination
             });
-            break;
           }
 
-          const bookingSeatIds = new Set(
-            booking.seats.map(s =>
-              typeof s === 'string'
-                ? String(s)
-                : String(s.label || s.seatId || s.id)
-            )
-          );
+          // Last resort: match on flightNumber if stored separately
+          if (!map && booking.flightNumber && booking.travelDate) {
+            map = await SeatMap.findOne({
+              flightId: booking.flightNumber,
+              travelDate: booking.travelDate,
+              origin: booking.origin,
+              destination: booking.destination
+            });
+          }
 
-          let updated = false;
+          if (!map) {
+            console.error('[payments] seatMap not found for booking', {
+              bookingId: booking._id,
+              seatMapId: booking.seatMapId,
+              flightId: booking.flightId,
+              flightNumber: booking.flightNumber,
+              travelDate: booking.travelDate,
+              origin: booking.origin,
+              destination: booking.destination
+            });
+            // Don't break — booking is already confirmed; seat map miss is non-fatal
+          } else {
+            // Build a normalised set of the seat IDs stored on the booking
+            // booking.seats entries are { seatId, label, row, col } objects (from normalizeSeats)
+            const bookingSeatIds = new Set(
+              booking.seats.map(s =>
+                typeof s === 'string'
+                  ? String(s)
+                  : String(s.seatId || s.label || s.id || '')
+              ).filter(Boolean)
+            );
 
-          for (const seat of map.seats) {
-            if (!seat) continue;
+            let updated = false;
 
-            const seatKey = String(seat.label || seat.seatId || seat.id);
-            if (bookingSeatIds.has(seatKey)) {
-              seat.status = 'booked';
-              seat.heldBy = null;
+            for (const seat of map.seats) {
+              if (!seat) continue;
+              // SeatMap seats always have seatId; check label too for safety
+              const seatKey = String(seat.seatId || seat.label || '');
+              if (!seatKey || !bookingSeatIds.has(seatKey)) continue;
+
+              seat.status    = 'booked';
+              seat.heldBy    = null;
               seat.holdUntil = null;
+              seat.heldUntil = null; // clear frontend countdown alias too
               updated = true;
             }
-          }
 
-          if (updated) {
-            map.markModified('seats');
-            map.updatedAt = new Date();
-            await map.save();
-            console.log('[payments] seats finalized for booking', booking._id.toString());
-          } else {
-            console.warn('[payments] no matching seats found in seatMap', {
-              bookingId: booking._id,
-              bookingSeatIds: [...bookingSeatIds]
-            });
+            if (updated) {
+              map.markModified('seats');
+              map.updatedAt = new Date();
+              await map.save();
+              console.log('[payments] seats finalized as booked for booking', booking._id.toString(), [...bookingSeatIds]);
+            } else {
+              console.warn('[payments] no matching seats found in seatMap', {
+                bookingId: booking._id,
+                bookingSeatIds: [...bookingSeatIds],
+                seatMapId: map._id
+              });
+            }
           }
         }
 

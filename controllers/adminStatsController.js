@@ -1,3 +1,4 @@
+// controllers/adminStatsController.js
 const Booking = require('../models/Booking');
 const ReconciliationLog = require('../models/ReconciliationLog');
 
@@ -8,7 +9,11 @@ exports.overviewStats = async (req, res) => {
     const totalBookings = await Booking.countDocuments();
 
     const confirmedBookings = await Booking.countDocuments({
-      paymentStatus: 'PAID'
+      $or: [
+        { paymentStatus: 'PAID' },
+        { bookingStatus: 'CONFIRMED' },
+        { bookingStatus: 'TICKETED' }
+      ]
     });
 
     const cancelledBookings = await Booking.countDocuments({
@@ -17,38 +22,44 @@ exports.overviewStats = async (req, res) => {
 
     const pendingPayments = await Booking.countDocuments({
       paymentStatus: 'PENDING',
-      bookingStatus: 'PENDING'
+      bookingStatus: { $in: ['PENDING', 'HELD'] }
     });
 
     /* ---------------- REVENUE ---------------- */
 
     const revenueAgg = await Booking.aggregate([
       { $match: { paymentStatus: 'PAID' } },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: '$price.amount' }
-        }
-      }
+      { $group: { _id: null, total: { $sum: '$price.amount' } } }
     ]);
 
     const refundsAgg = await Booking.aggregate([
       { $match: { paymentStatus: { $in: ['REFUNDED', 'PARTIALLY_REFUNDED'] } } },
-      { $unwind: '$refunds' },
       {
         $group: {
           _id: null,
-          total: { $sum: '$refunds.amount' }
+          total: {
+            $sum: {
+              $cond: [
+                { $isArray: '$refunds' },
+                { $sum: '$refunds.amount' },
+                0
+              ]
+            }
+          }
         }
       }
     ]);
 
-    /* ---------------- RECENT BOOKINGS ---------------- */
+    /* ---------------- RECENT BOOKINGS (expanded fields for new UI) ---------------- */
 
     const recentBookings = await Booking.find()
       .sort({ createdAt: -1 })
-      .limit(5)
-      .select('bookingRef paymentStatus price createdAt')
+      .limit(10)
+      .select(
+        'bookingRef bookingStatus paymentStatus price createdAt ' +
+        'origin destination airlineCode flightNumber ' +
+        'contact passengers travelDate'
+      )
       .lean();
 
     /* ---------------- LAST RECONCILIATION ---------------- */
@@ -57,32 +68,25 @@ exports.overviewStats = async (req, res) => {
       .sort({ runAt: -1 })
       .lean();
 
-    /* ---------------- REVENUE TREND (LAST 7 DAYS) ---------------- */
+    /* ---------------- REVENUE TREND (LAST 14 DAYS) ---------------- */
 
     const revenueTrendRaw = await Booking.aggregate([
       {
         $match: {
           paymentStatus: 'PAID',
-          createdAt: {
-            $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
-          }
+          createdAt: { $gte: new Date(Date.now() - 14 * 24 * 60 * 60 * 1000) }
         }
       },
       {
         $group: {
-          _id: {
-            $dateToString: { format: '%Y-%m-%d', date: '$createdAt' }
-          },
+          _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
           amount: { $sum: '$price.amount' }
         }
       },
       { $sort: { _id: 1 } }
     ]);
 
-    const revenueTrend = revenueTrendRaw.map(r => ({
-      date: r._id,
-      amount: r.amount
-    }));
+    const revenueTrend = revenueTrendRaw.map(r => ({ date: r._id, amount: r.amount }));
 
     /* ---------------- RESPONSE ---------------- */
 

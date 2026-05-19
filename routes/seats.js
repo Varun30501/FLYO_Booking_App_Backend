@@ -1,139 +1,134 @@
-// backend/routes/seats.js
+// routes/seats.js — with fallback to any matching route template
 const express = require('express');
-const router = express.Router();
+const router  = express.Router();
 const SeatMap = require('../models/SeatMap');
-const Booking = require('../models/Booking'); // optional if you create Booking here
-const mongoose = require('mongoose');
-
-/**
- * helper: release expired holds in a seatMap document (robust version)
- * - updates in-place where possible
- * - avoids calling toObject() on plain objects
- * - marks seats modified if replaced with plain objects
- */
-
-// function extractTravelDate(req) {
-//   return (
-//     req.query?.date ||
-//     req.body?.date ||
-//     req.body?.travelDate ||
-//     null
-//   );
-// }
 
 function extractTravelDate(req) {
   return req.query?.date || req.body?.travelDate || null;
 }
 
+/**
+ * Derive exit-row set for a given layout.
+ * Exit rows are placed ~25% and ~65% into the Economy section.
+ * Economy starts at row 11 (after First 1-2, Business 3-5, PremiumEco 6-10).
+ */
+function buildExitRowsForRoute(rows) {
+  const economyStart = 11;
+  const economyRows  = Math.max(1, rows - economyStart);
+  return new Set([
+    economyStart + Math.floor(economyRows * 0.25),
+    economyStart + Math.floor(economyRows * 0.65),
+  ]);
+}
+
+/**
+ * Backfill features for a seat that came from a legacy template without features.
+ */
+function backfillFeatures(s, cols, exitRows) {
+  const row = Number(s.row);
+  const col = Number(s.col);
+  const isExitRow  = exitRows.has(row);
+  const isBulkhead = row === 1 || row === 6 || row === 11;
+  const isWindow   = col === 1 || col === cols;
+  const isAisle    = col === Math.ceil(cols / 2) || col === Math.ceil(cols / 2) + 1;
+  return {
+    extraLegroom: isExitRow || isBulkhead,
+    exitRow:      isExitRow,
+    window:       isWindow,
+    aisle:        isAisle,
+    bulkhead:     isBulkhead,
+  };
+}
+
 async function releaseExpiredHolds(map) {
   const now = new Date();
   let changed = false;
-
   if (!map || !Array.isArray(map.seats)) return { map, changed };
-
   map.seats.forEach((s) => {
-    if (!s) return;
-    if (s.status === 'held' && s.holdUntil) {
-      if (new Date(s.holdUntil) <= now) {
-        s.status = 'free';
-        s.heldBy = null;
-        s.holdUntil = null;
-        changed = true;
-      }
+    if (s?.status === 'held' && s.holdUntil && new Date(s.holdUntil) <= now) {
+      s.status = 'free'; s.heldBy = null; s.holdUntil = null; changed = true;
     }
   });
-
   return { map, changed };
 }
 
-
-// GET seat map
+// GET /:flightId — returns seat map, with 4-tier fallback for DB-seeded flights
 router.get('/:flightId', async (req, res) => {
   try {
     const { flightId } = req.params;
-    const travelDate = extractTravelDate(req);
+    const travelDate   = extractTravelDate(req);
     const { origin, destination } = req.query;
 
-    if (!travelDate) {
-      return res.status(400).json({ error: 'travelDate is required' });
-    }
+    if (!travelDate)             return res.status(400).json({ error: 'travelDate is required' });
+    if (!origin || !destination) return res.status(400).json({ error: 'origin and destination are required' });
 
-    if (!origin || !destination) {
-      return res.status(400).json({
-        error: 'origin and destination are required'
-      });
-    }
-
-    // 1️⃣ Try exact seatMap first (instance)
-    let map = await SeatMap.findOne({
-      flightId: String(flightId),
-      travelDate,
-      origin,
-      destination
-    });
-
-    // 2️⃣ If not found → clone from template
-    if (!map) {
-      const template = await SeatMap.findOne({
-        flightId: String(flightId)
-      })
-        .sort({ updatedAt: -1 })
-        .lean();
-
-      if (!template) {
-        return res.status(404).json({
-          success: false,
-          message: `Seat map template not found for flight ${flightId}`
+    // 1️⃣ Exact match: specific flight + date + route
+    let map = await SeatMap.findOne({ flightId: String(flightId), travelDate, origin, destination });
+    if (map) {
+      // Backfill features on existing records that predate the features field
+      const needsBackfill = map.seats.some(s => !s.features || s.features.extraLegroom === undefined);
+      if (needsBackfill) {
+        const exitRowsSet = buildExitRowsForRoute(map.rows || 25);
+        map.seats = map.seats.map(s => {
+          if (s.features && s.features.extraLegroom !== undefined) return s;
+          const f = backfillFeatures(s, map.cols || 6, exitRowsSet);
+          s.features = f;
+          return s;
         });
+        map.updatedAt = new Date();
+        await map.save();
       }
-
-      map = await SeatMap.create({
-        // identity
-        flightId: template.flightId,
-
-        // route identity (NEW for v3)
-        origin,
-        destination,
-        travelDate,
-
-        // static flight data
-        airline: template.airline,
-        airlineCode: template.airlineCode,
-        departsAt: template.departsAt,
-
-        // layout
-        rows: template.rows,
-        cols: template.cols,
-        layoutMeta: template.layoutMeta,
-        aliases: template.aliases,
-
-        // seats (reset state)
-        seats: (template.seats || []).map(s => ({
-          ...s,
-          status: 'free',
-          heldBy: null,
-          holdUntil: null
-        })),
-
-        createdAt: new Date(),
-        updatedAt: new Date()
-      });
+      const { map: safe, changed } = await releaseExpiredHolds(map);
+      if (changed) { safe.updatedAt = new Date(); await safe.save(); }
+      return res.json(buildResponse(safe));
     }
 
-    // 3️⃣ Cleanup expired holds
-    const { map: safeMap } = await releaseExpiredHolds(map);
+    // 2️⃣ Template for this specific flight (any date)
+    let template = await SeatMap.findOne({ flightId: String(flightId) }).sort({ updatedAt: -1 }).lean();
 
-    return res.json({
-      ok: true,
-      flightId: safeMap.flightId,
-      travelDate: safeMap.travelDate,
-      origin: safeMap.origin,
-      destination: safeMap.destination,
-      rows: safeMap.rows,
-      cols: safeMap.cols,
-      seats: safeMap.seats,
-      layoutMeta: safeMap.layoutMeta
+    // 3️⃣ FALLBACK: any template matching this origin+destination pair (ignores flightId)
+    //    This makes DB-seeded fallback flights work with the existing 20 seat maps
+    if (!template) {
+      template = await SeatMap.findOne({ origin, destination }).sort({ updatedAt: -1 }).lean();
+    }
+
+    // 4️⃣ LAST RESORT: any seat map at all (generic layout)
+    if (!template) {
+      template = await SeatMap.findOne({}).sort({ updatedAt: -1 }).lean();
+    }
+
+    if (!template) {
+      return res.status(404).json({ success: false, message: `No seat map available for ${origin}→${destination}` });
+    }
+
+    // Clone template for this specific flight+date+route
+    // Backfill features for legacy templates that were seeded without them
+    const totalRows = template.rows || 25;
+    const totalCols = template.cols || 6;
+    const exitRowsSet = buildExitRowsForRoute(totalRows);
+
+    map = await SeatMap.create({
+      flightId:    String(flightId),
+      origin, destination, travelDate,
+      airline:     template.airline    || '',
+      airlineCode: template.airlineCode || '',
+      departsAt:   template.departsAt  || null,
+      rows:        totalRows,
+      cols:        totalCols,
+      layoutMeta:  template.layoutMeta || {},
+      aliases:     template.aliases    || [],
+      seats: (template.seats || []).map(s => {
+        const features = (s.features && s.features.extraLegroom !== undefined)
+          ? s.features
+          : backfillFeatures(s, totalCols, exitRowsSet);
+        return { ...s, status: 'free', heldBy: null, holdUntil: null, heldUntil: null, features };
+      }),
+      createdAt: new Date(),
+      updatedAt: new Date()
     });
+
+    const { map: safe } = await releaseExpiredHolds(map);
+    return res.json(buildResponse(safe));
 
   } catch (err) {
     console.error('[seats.get] error', err);
@@ -141,280 +136,124 @@ router.get('/:flightId', async (req, res) => {
   }
 });
 
+function buildResponse(m) {
+  return {
+    ok: true,
+    flightId:    m.flightId,
+    travelDate:  m.travelDate,
+    origin:      m.origin,
+    destination: m.destination,
+    rows:        m.rows,
+    cols:        m.cols,
+    seats:       (m.seats || []).map(s => ({
+      seatId:        s.seatId,
+      row:           s.row,
+      col:           s.col,
+      seatClass:     s.seatClass,
+      priceModifier: s.priceModifier,
+      status:        s.status,
+      heldBy:        s.heldBy || null,
+      holdUntil:     s.holdUntil || null,
+      heldUntil:     s.holdUntil || null, // alias for frontend countdown timer
+      features: {
+        extraLegroom: !!(s.features?.extraLegroom || s.features?.exitRow),
+        exitRow:      !!(s.features?.exitRow),
+        window:       !!(s.features?.window),
+        aisle:        !!(s.features?.aisle),
+        bulkhead:     !!(s.features?.bulkhead),
+      },
+    })),
+    layoutMeta:  m.layoutMeta,
+    defaultPrice: m.defaultPrice || m.layoutMeta?.defaultPrice || 0
+  };
+}
 
-// POST hold seats (in-place updates; defensive)
-// Body: { seats: ["1A","1B"], holdMinutes: 10, heldBy: "user-id-or-ip" }
+// POST /:flightId/hold
 router.post('/:flightId/hold', async (req, res) => {
-  // const { date } = req.query;
-  // if (!date) {
-  //   return res.status(400).json({ error: 'travelDate is required' });
-  // }
-
   const { flightId } = req.params;
-  const payload = req.body || {};
-  const seats = Array.isArray(payload.seats) ? payload.seats : [];
-  const holdMinutes = Number.isFinite(payload.holdMinutes) ? Number(payload.holdMinutes) : (payload.holdMinutes ? Number(payload.holdMinutes) : 10);
-  // prefer explicit body heldBy, else authenticated user, else req.ip
-  const heldBy = payload.heldBy || (req.user ? (req.user._id || req.user.id) : null) || req.ip;
+  const payload      = req.body || {};
+  const seats        = Array.isArray(payload.seats) ? payload.seats : [];
+  const holdMinutes  = Number.isFinite(payload.holdMinutes) ? payload.holdMinutes : 10;
+  const heldBy       = payload.heldBy || req.user?._id || req.user?.id || req.ip;
+  const travelDate   = extractTravelDate(req);
+  const origin       = req.query?.origin || req.body?.origin || null;
+  const destination  = req.query?.destination || req.body?.destination || null;
 
-  if (!Array.isArray(seats) || seats.length === 0) return res.status(400).json({ error: 'seats required' });
+  if (!seats.length)           return res.status(400).json({ error: 'seats required' });
+  if (!travelDate)             return res.status(400).json({ error: 'travelDate required' });
+  if (!origin || !destination) return res.status(400).json({ error: 'origin and destination required' });
 
   try {
-    // find seatmap via flexible keys (flightId could be airline code, _id, etc.)
-    // Try to get travelDate from request
-    let travelDate = extractTravelDate(req);
-
-    // Find seatMap (date-aware but tolerant)
-    // Find seatMap (date-aware but tolerant)
-    let map = null;
-
-    // 1️⃣ Try date-specific seatMap
-    // 
-
-    if (!travelDate) {
-      return res.status(400).json({ error: 'travelDate is required' });
-    }
-
-    const origin = req.query?.origin || req.body?.origin || null;
-    const destination = req.query?.destination || req.body?.destination || null;
-
-    if (!origin || !destination) {
-      return res.status(400).json({
-        error: 'origin and destination are required'
-      });
-    }
-
-    map = await SeatMap.findOne({
-      flightId,
+    // Only ever look up the exact document for this flight + date + route.
+    // Falling back to a different date or omitting origin/destination risks finding
+    // a template clone or a different route's doc — writing held/booked state there
+    // leaves the real document untouched and makes those seats appear free to other users.
+    const map = await SeatMap.findOne({
+      flightId: String(flightId),
       travelDate,
       origin,
       destination
-    }).exec();
-
-    if (!map) {
-      return res.status(404).json({
-        error: 'Seat map not found for selected date'
-      });
-    }
-
-
-    if (!map) {
-      return res.status(404).json({ error: 'Seat map not found' });
-    }
-
-    // derive travelDate if missing
-    if (!travelDate && map.travelDate) {
-      travelDate = map.travelDate;
-    }
-
-
-    // 🔧 If request did not send travelDate, derive it from seatMap
-    if (!travelDate && map.travelDate) {
-      travelDate = map.travelDate;
-    }
-
-
-    if (!map) return res.status(404).json({ error: 'Seat map not found' });
-
-    // release expired holds first (defensive)
-    await releaseExpiredHolds(map);
-
-    // initial validation: ensure all requested seats exist and are free or held by same heldBy
-    for (const seatId of seats) {
-      const s = map.seats.find(x => x && x.seatId === seatId);
-      if (!s) return res.status(400).json({ error: `invalid seat ${seatId}` });
-      if (s.status === 'booked') return res.status(409).json({ error: `seat ${seatId} already booked` });
-      if (s.status === 'held' && s.heldBy && s.heldBy !== heldBy) {
-        return res.status(409).json({ error: `seat ${seatId} held by someone else` });
-      }
-    }
-
-    // prepare hold
-    const now = new Date();
-    const holdUntil = new Date(now.getTime() + Math.max(1, Number(holdMinutes)) * 60 * 1000);
-
-    // --- RACE AVOIDANCE: re-fetch latest doc right before applying changes and re-check statuses ---
-    const fresh = await SeatMap.findOne({
-      _id: map._id,
-      travelDate
-    }).exec();
-
-    if (!fresh) return res.status(500).json({ error: 'Seat map vanished' });
-
-    // ensure none of the seats are now booked or held by someone else
-    for (const seatId of seats) {
-      const s = fresh.seats.find(x => x && x.seatId === seatId);
-      if (!s) return res.status(400).json({ error: `invalid seat ${seatId}` });
-      if (s.status === 'booked') return res.status(409).json({ error: `seat ${seatId} already booked` });
-      if (s.status === 'held' && s.heldBy && s.heldBy !== heldBy) {
-        return res.status(409).json({ error: `seat ${seatId} held by someone else` });
-      }
-    }
-
-    // apply holds to fresh doc in-place
-    let madeChange = false;
-    fresh.seats.forEach((s, idx) => {
-      if (!s) return;
-      if (seats.includes(s.seatId)) {
-        if (typeof s.toObject === 'function') {
-          s.status = 'held';
-          s.heldBy = heldBy;
-          s.holdUntil = holdUntil;
-        } else {
-          fresh.seats[idx] = { ...s, status: 'held', heldBy, holdUntil };
-        }
-        madeChange = true;
-      }
     });
 
-    if (madeChange) {
-      try { fresh.markModified && fresh.markModified('seats'); } catch (e) { /* ignore */ }
-      fresh.updatedAt = new Date();
-      await fresh.save();
+    if (!map) return res.status(404).json({ error: `Seat map not found for ${flightId} on ${travelDate} (${origin}→${destination})` });
+
+    const { map: clearedMap } = await releaseExpiredHolds(map);
+    const holdUntil = new Date(Date.now() + holdMinutes * 60_000);
+    const failed = [];
+    const held   = [];
+
+    for (const seatId of seats) {
+      const seat = clearedMap.seats?.find(s => s.seatId === seatId);
+      if (!seat) { failed.push({ seatId, reason: 'not_found' }); continue; }
+      if (seat.status !== 'free') { failed.push({ seatId, reason: seat.status }); continue; }
+      seat.status    = 'held';
+      seat.heldBy    = String(heldBy);
+      seat.holdUntil = holdUntil;
+      seat.heldUntil = holdUntil; // alias for frontend countdown timer
+      held.push(seatId);
     }
 
-    return res.json({ ok: true, holdUntil, seats });
+    if (held.length === 0) {
+      return res.status(409).json({ ok: false, error: 'No seats could be held', failed });
+    }
+
+    clearedMap.updatedAt = new Date();
+    await clearedMap.save();
+
+    return res.json({ ok: true, held, failed, holdUntil });
   } catch (err) {
-    console.error('[seats HOLD] uncaught error:', err);
-    return res.status(500).json({ error: 'server error', message: err.message });
+    console.error('[seats.hold] error', err);
+    return res.status(500).json({ error: 'hold failed' });
   }
 });
 
-router.post('/:flightId/confirm', async (req, res) => {
-  return res.status(410).json({
-    error: 'DEPRECATED',
-    message: 'Seat confirmation is handled via payment flow (SeatMap v2)'
-  });
-});
-
-// POST release seats (manual)
+// POST /:flightId/release
 router.post('/:flightId/release', async (req, res) => {
   const { flightId } = req.params;
-  const { seats = [], heldBy } = req.body;
-  if (!Array.isArray(seats) || seats.length === 0) return res.status(400).json({ error: 'seats required' });
+  const { seats = [], heldBy } = req.body || {};
+  const travelDate = extractTravelDate(req);
 
   try {
+    const map = await SeatMap.findOne({
+      flightId: String(flightId),
+      ...(travelDate ? { travelDate } : {})
+    }).sort({ updatedAt: -1 });
 
+    if (!map) return res.status(404).json({ error: 'seat map not found' });
 
-    let travelDate = extractTravelDate(req);
-
-    // find seatMap (date-aware but tolerant)
-    // Find seatMap (date-aware but tolerant)
-    let map = null;
-
-
-
-    if (!travelDate) {
-      return res.status(400).json({ error: 'travelDate is required' });
-    }
-
-    const origin = req.query?.origin || req.body?.origin || null;
-    const destination = req.query?.destination || req.body?.destination || null;
-
-    if (!origin || !destination) {
-      return res.status(400).json({
-        error: 'origin and destination are required'
-      });
-    }
-
-    map = await SeatMap.findOne({
-      flightId,
-      travelDate,
-      origin,
-      destination
-    }).exec();
-
-    if (!map) {
-      return res.status(404).json({
-        error: 'Seat map not found for selected date'
-      });
-    }
-
-
-    if (!map) {
-      return res.status(404).json({ error: 'Seat map not found' });
-    }
-
-    // derive travelDate if missing
-    if (!travelDate && map.travelDate) {
-      travelDate = map.travelDate;
-    }
-
-
-    // derive travelDate from seatMap if missing
-    if (!travelDate && map.travelDate) {
-      travelDate = map.travelDate;
-    }
-
-
-
-    if (!map) return res.status(404).json({ error: 'Seat map not found' });
-
-    let changed = false;
-    map.seats.forEach((s, idx) => {
-      if (!s) return;
-      if (seats.includes(s.seatId)) {
-        // only release if held (and optionally heldBy matches)
-        if (s.status === 'held' && (!heldBy || s.heldBy === heldBy || s.heldBy === req.ip)) {
-          if (typeof s.toObject === 'function') {
-            s.status = 'free';
-            s.heldBy = null;
-            s.holdUntil = null;
-          } else {
-            map.seats[idx] = { ...s, status: 'free', heldBy: null, holdUntil: null };
-          }
-          changed = true;
-        }
+    let released = 0;
+    for (const seatId of seats) {
+      const seat = map.seats?.find(s => s.seatId === seatId);
+      if (!seat) continue;
+      if (seat.status === 'held' && (!heldBy || seat.heldBy === String(heldBy))) {
+        seat.status = 'free'; seat.heldBy = null; seat.holdUntil = null; released++;
       }
-    });
-
-    if (changed) {
-      try { map.markModified && map.markModified('seats'); } catch (e) { /* ignore */ }
-      map.updatedAt = new Date();
-      await map.save();
     }
-
-    return res.json({ ok: true });
+    map.updatedAt = new Date();
+    await map.save();
+    return res.json({ ok: true, released });
   } catch (err) {
-    console.error('[seats RELEASE]', err);
-    return res.status(500).json({ error: 'server error' });
-  }
-});
-
-// DEBUG: inspect seat status for a flight
-router.get('/:flightId/debug', async (req, res) => {
-  try {
-    const { flightId } = req.params;
-
-    const { date } = req.query;
-
-    const query = {
-      $or: [
-        { flightId },
-        { legacyFlightId: flightId },
-        { aliases: flightId },
-        { airlineCode: flightId }
-      ]
-    };
-
-    if (date) {
-      query.travelDate = date;
-    }
-
-    const map = await SeatMap.findOne(query).exec();
-
-
-    if (!map) {
-      return res.status(404).json({
-        ok: false,
-        message: 'seatmap not found for this flight and date'
-      });
-    }
-
-    return res.json({ ok: true, map });
-
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    return res.status(500).json({ error: 'release failed' });
   }
 });
 
